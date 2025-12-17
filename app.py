@@ -15,7 +15,7 @@ col1, col2 = st.columns(2)
 with col1:
     universe = st.selectbox(
         "1. Select Market Universe:",
-        ("S&P 500 (Large Cap)", "S&P 400 (Mid Cap)", "S&P 600 (Small Cap)", "S&P 1500 (All Quality US Stocks)")
+        ("S&P 500 (Large Cap)", "S&P 400 (Mid Cap)", "S&P 600 (Small Cap)", "S&P 1500 (All Quality)", "Nasdaq 100 (Tech & Growth)")
     )
 
 with col2:
@@ -33,22 +33,35 @@ def get_tickers(selection):
     tickers = []
     
     try:
-        # 1. S&P 500 (Large)
+        # 1. S&P 500
         if "500" in selection or "1500" in selection:
             url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
             tickers.extend(pd.read_html(requests.get(url, headers=headers).text)[0]['Symbol'].tolist())
             
-        # 2. S&P 400 (Mid)
+        # 2. S&P 400
         if "400" in selection or "1500" in selection:
             url = 'https://en.wikipedia.org/wiki/List_of_S%26P_400_companies'
             tickers.extend(pd.read_html(requests.get(url, headers=headers).text)[0]['Symbol'].tolist())
 
-        # 3. S&P 600 (Small)
+        # 3. S&P 600
         if "600" in selection or "1500" in selection:
             url = 'https://en.wikipedia.org/wiki/List_of_S%26P_600_companies'
             tickers.extend(pd.read_html(requests.get(url, headers=headers).text)[0]['Symbol'].tolist())
 
-        # Clean tickers (Change BRK.B to BRK-B and remove duplicates)
+        # 4. Nasdaq 100 (NEW)
+        if "Nasdaq" in selection:
+            url = 'https://en.wikipedia.org/wiki/Nasdaq-100'
+            dfs = pd.read_html(requests.get(url, headers=headers).text)
+            # Find the table with 'Ticker' or 'Symbol'
+            for df in dfs:
+                if 'Ticker' in df.columns:
+                    tickers.extend(df['Ticker'].tolist())
+                    break
+                elif 'Symbol' in df.columns:
+                    tickers.extend(df['Symbol'].tolist())
+                    break
+
+        # Clean tickers
         tickers = list(set([t.replace('.', '-') for t in tickers]))
         return tickers
         
@@ -80,7 +93,6 @@ def check_layer_a(ticker):
         trend = (curr['Close'] > curr['SMA_20']) and (curr['Close'] > curr['SMA_50'])
         alignment = curr['SMA_20'] > curr['SMA_50']
         
-        # Consolidation (Avg of last 4 weeks < 8%)
         if len(df) >= 4:
             consolidation = df['NATR'].iloc[-5:-1].mean() < 8 
         else:
@@ -112,7 +124,7 @@ def check_sniper(ticker):
         df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], length=14)
         df['NATR'] = (df['ATR'] / df['Close']) * 100
         
-        # Box High (Max of previous 12 weeks)
+        # Box High
         df['Box_High'] = df['High'].rolling(12).max().shift(1)
         
         # MACD
@@ -164,7 +176,6 @@ if st.button("🚀 RUN SCAN"):
     results = []
     
     for i, ticker in enumerate(tickers):
-        # Update progress bar every 10 stocks
         if i % 10 == 0: 
             progress.progress((i+1)/len(tickers))
             status.text(f"Scanning: {ticker}")
