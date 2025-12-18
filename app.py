@@ -16,13 +16,19 @@ try:
 except Exception:
     ZoneInfo = None
 
-
 # =========================
 # Page
 # =========================
 st.set_page_config(page_title="Financial Wisdom Scanner (Full Universe)", page_icon="📈", layout="wide")
 st.title("📈 Financial Wisdom Scanner — Full Universe (Tech + Fundamentals QC)")
 st.caption("Weekly breakouts + consolidation box + risk-defined execution + fundamentals QC. Full S&P 500 / NASDAQ / NYSE / AMEX universes supported.")
+
+# =========================
+# HTTP headers (prevents 403/blocks)
+# =========================
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
+}
 
 # =========================
 # Time helpers
@@ -47,7 +53,6 @@ def weekly_close_confirmed() -> bool:
         return True
     return False
 
-
 # =========================
 # Parsing helpers
 # =========================
@@ -70,97 +75,149 @@ def parse_tickers(text: str) -> List[str]:
 def chunked(xs: List[str], n: int) -> List[List[str]]:
     return [xs[i:i+n] for i in range(0, len(xs), n)]
 
+def _dedupe_clean_symbols(symbols: List[str]) -> List[str]:
+    out = []
+    seen = set()
+    for s in symbols:
+        s = str(s).strip().upper().replace(".", "-")
+        if not s or s in ("N/A", "NA", "NONE", "NAN"):
+            continue
+        if "^" in s or "/" in s:
+            continue
+        if s not in seen:
+            out.append(s)
+            seen.add(s)
+    return out
 
 # =========================
-# Universe loaders (AUTO)
+# Universe loaders (ROBUST)
 # =========================
-@st.cache_data(show_spinner=False, ttl=60*60*12)  # 12h
+@st.cache_data(show_spinner=False, ttl=60*60*12)
 def load_sp500() -> List[str]:
-    # Wikipedia HTML table (requires lxml)
-    url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-    tables = pd.read_html(url)
-    df = tables[0]
-    syms = df["Symbol"].astype(str).str.replace(".", "-", regex=False).str.upper().tolist()
-    return sorted(list(dict.fromkeys(syms)))
+    """
+    Robust loader:
+    1) GitHub dataset (fast/reliable on Streamlit Cloud)
+    2) Wikipedia fallback with requests+UA
+    """
+    github_urls = [
+        "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/master/data/constituents.csv",
+        "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/master/data/constituents_symbols.txt",
+    ]
+    for url in github_urls:
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=30)
+            r.raise_for_status()
+            text = r.text
+            if url.endswith(".txt"):
+                syms = [ln.strip() for ln in text.splitlines() if ln.strip()]
+                return _dedupe_clean_symbols(syms)
+            df = pd.read_csv(io.StringIO(text))
+            col = "Symbol" if "Symbol" in df.columns else df.columns[0]
+            syms = df[col].astype(str).tolist()
+            return _dedupe_clean_symbols(syms)
+        except Exception:
+            pass
+
+    try:
+        url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+        r = requests.get(url, headers=HEADERS, timeout=30)
+        r.raise_for_status()
+        tables = pd.read_html(io.StringIO(r.text))
+        df = tables[0]
+        syms = df["Symbol"].astype(str).tolist()
+        return _dedupe_clean_symbols(syms)
+    except Exception:
+        st.error("Failed to load S&P 500 constituents (network/blocked). Try again later or switch to an Exchange universe.")
+        return []
 
 @st.cache_data(show_spinner=False, ttl=60*60*12)
 def load_nasdaq100() -> List[str]:
-    url = "https://en.wikipedia.org/wiki/Nasdaq-100"
-    tables = pd.read_html(url)
-    # Most pages have a constituents table; pick the one with "Ticker" or "Company"
-    best = None
-    for t in tables:
-        cols = [c.lower() for c in t.columns.astype(str).tolist()]
-        if any("ticker" in c for c in cols) or any("symbol" in c for c in cols):
-            best = t
-            break
-    if best is None:
-        # fallback: try first table
-        best = tables[0]
-    # Find likely symbol column
-    sym_col = None
-    for c in best.columns:
-        cl = str(c).lower()
-        if "ticker" in cl or "symbol" in cl:
-            sym_col = c
-            break
-    if sym_col is None:
-        sym_col = best.columns[0]
-    syms = best[sym_col].astype(str).str.replace(".", "-", regex=False).str.upper().tolist()
-    # remove garbage rows
-    syms = [s for s in syms if s.isascii() and len(s) <= 8 and any(ch.isalpha() for ch in s)]
-    return sorted(list(dict.fromkeys(syms)))
+    """
+    Robust loader via Wikipedia with requests+UA (graceful failure).
+    """
+    try:
+        url = "https://en.wikipedia.org/wiki/Nasdaq-100"
+        r = requests.get(url, headers=HEADERS, timeout=30)
+        r.raise_for_status()
+        tables = pd.read_html(io.StringIO(r.text))
+
+        best = None
+        for t in tables:
+            cols = [str(c).lower() for c in t.columns]
+            if any("ticker" in c for c in cols) or any("symbol" in c for c in cols):
+                best = t
+                break
+        if best is None:
+            best = tables[0]
+
+        sym_col = None
+        for c in best.columns:
+            cl = str(c).lower()
+            if "ticker" in cl or "symbol" in cl:
+                sym_col = c
+                break
+        if sym_col is None:
+            sym_col = best.columns[0]
+
+        syms = best[sym_col].astype(str).tolist()
+        syms = [s for s in syms if s.isascii() and len(s) <= 8 and any(ch.isalpha() for ch in s)]
+        return _dedupe_clean_symbols(syms)
+    except Exception:
+        st.error("Failed to load Nasdaq-100 constituents (network/blocked). Try again or use an Exchange universe.")
+        return []
 
 @st.cache_data(show_spinner=False, ttl=60*60*12)
 def load_russell1000() -> List[str]:
     """
-    Russell 1000 full list isn't reliably published in one official open endpoint.
-    Practical approach: use a maintained public symbol list.
-    This pulls from a widely-used GitHub raw file (can be swapped later).
+    Russell 1000 via a maintained public list (GitHub raw).
     """
     url = "https://raw.githubusercontent.com/rreichel3/US-Stock-Symbols/main/russell1000/russell1000.csv"
-    r = requests.get(url, timeout=30)
-    r.raise_for_status()
-    df = pd.read_csv(io.StringIO(r.text))
-    # Expect a column named Symbol or similar
-    col = None
-    for c in df.columns:
-        if str(c).lower() in ("symbol", "ticker"):
-            col = c
-            break
-    if col is None:
-        col = df.columns[0]
-    syms = df[col].astype(str).str.replace(".", "-", regex=False).str.upper().tolist()
-    syms = [s for s in syms if s.isascii() and len(s) <= 8 and any(ch.isalpha() for ch in s)]
-    return sorted(list(dict.fromkeys(syms)))
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=30)
+        r.raise_for_status()
+        df = pd.read_csv(io.StringIO(r.text))
+        col = None
+        for c in df.columns:
+            if str(c).lower() in ("symbol", "ticker"):
+                col = c
+                break
+        if col is None:
+            col = df.columns[0]
+        syms = df[col].astype(str).tolist()
+        syms = [s for s in syms if s.isascii() and len(s) <= 8 and any(ch.isalpha() for ch in s)]
+        return _dedupe_clean_symbols(syms)
+    except Exception:
+        st.error("Failed to load Russell 1000 list. Try again later or use Exchange universe.")
+        return []
 
 @st.cache_data(show_spinner=False, ttl=60*60*12)
 def load_exchange_list(exchange: str) -> List[str]:
     """
-    Pulls full US symbol directories from Nasdaq Trader (official-ish list endpoints).
-    exchange: "NASDAQ" | "NYSE" | "AMEX" | "ALL"
+    Full US symbol directories from NasdaqTrader (pipe-delimited).
+    exchange: 'NASDAQ' | 'NYSE' | 'AMEX' | 'ALL'
     """
-    # Nasdaq Trader symbol directories (pipe-delimited)
     listed_url = "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt"
     other_url  = "https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt"
 
     def fetch_txt(url: str) -> pd.DataFrame:
-        r = requests.get(url, timeout=30)
+        r = requests.get(url, headers=HEADERS, timeout=30)
         r.raise_for_status()
         lines = r.text.splitlines()
-        # last line is "File Creation Time"
         lines = [ln for ln in lines if ln and not ln.startswith("File Creation Time")]
         data = "\n".join(lines)
         return pd.read_csv(io.StringIO(data), sep="|")
 
-    df_nas = fetch_txt(listed_url)   # has Symbol
-    df_oth = fetch_txt(other_url)    # has ACT Symbol + Exchange
+    try:
+        df_nas = fetch_txt(listed_url)
+        df_oth = fetch_txt(other_url)
+    except Exception:
+        st.error("Failed to load exchange symbol lists (network/blocked). Try again later.")
+        return []
 
-    syms = []
+    syms: List[str] = []
     if exchange == "NASDAQ":
         syms = df_nas["Symbol"].astype(str).tolist()
     elif exchange in ("NYSE", "AMEX"):
-        # otherlisted uses "ACT Symbol" and "Exchange"
         if "ACT Symbol" in df_oth.columns and "Exchange" in df_oth.columns:
             syms = df_oth.loc[df_oth["Exchange"].astype(str).str.upper() == exchange, "ACT Symbol"].astype(str).tolist()
         else:
@@ -172,19 +229,16 @@ def load_exchange_list(exchange: str) -> List[str]:
     else:
         syms = df_nas["Symbol"].astype(str).tolist()
 
-    # Clean
     out = []
     for s in syms:
-        s = str(s).strip().upper()
+        s = str(s).strip().upper().replace(".", "-")
         if not s or s in ("N/A", "NA"):
             continue
-        # Nasdaq files sometimes include test issues, warrants, etc; keep simple equities
         if "^" in s or "/" in s:
             continue
-        out.append(s.replace(".", "-"))
+        out.append(s)
     out = [s for s in out if s.isascii() and len(s) <= 8 and any(ch.isalpha() for ch in s)]
-    return sorted(list(dict.fromkeys(out)))
-
+    return _dedupe_clean_symbols(out)
 
 # =========================
 # Technical scan core (FW)
@@ -243,7 +297,7 @@ def prior_high_close(df: pd.DataFrame, lookback: int) -> Optional[float]:
         return None
     return float(prior.max())
 
-def candle_quality(curr: pd.Series, prev: pd.Series) -> Tuple[Optional[float], Optional[float]]:
+def candle_quality(curr: pd.Series, prev: Optional[pd.Series]) -> Tuple[Optional[float], Optional[float]]:
     try:
         o, h, l, c = float(curr["Open"]), float(curr["High"]), float(curr["Low"]), float(curr["Close"])
         rng = max(1e-9, h - l)
@@ -264,7 +318,8 @@ def eval_fw_technical(symbol: str, df: pd.DataFrame, cfg: dict) -> ScanResult:
         rf.append(f"Not enough weekly history (need ≥ {cfg['min_weeks_history']}).")
         return ScanResult(symbol, "PASS", 0, None, None, None, rp, rf, {})
 
-    curr, prev = df.iloc[-1], (df.iloc[-2] if len(df) >= 2 else None)
+    curr = df.iloc[-1]
+    prev = df.iloc[-2] if len(df) >= 2 else None
     close = float(curr["Close"])
 
     ma = compute_sma(df["Close"], cfg["ma_weeks"])
@@ -330,7 +385,6 @@ def eval_fw_technical(symbol: str, df: pd.DataFrame, cfg: dict) -> ScanResult:
         else:
             rf.append(f"Close not above box high ({box_high:.2f}).")
 
-    # Volume spike (optional)
     vol_spike_pct = None
     if cfg["require_volume_spike"] and prev is not None:
         pv = float(prev["Volume"])
@@ -373,7 +427,6 @@ def eval_fw_technical(symbol: str, df: pd.DataFrame, cfg: dict) -> ScanResult:
     }
     return ScanResult(symbol, decision, score, entry, stop, risk_pct, rp, rf, metrics)
 
-
 # =========================
 # Fundamentals QC (Phase 2)
 # =========================
@@ -398,11 +451,8 @@ def _safe_num(x) -> Optional[float]:
     except Exception:
         return None
 
-@st.cache_data(show_spinner=False, ttl=60*60*6)  # 6h cache
+@st.cache_data(show_spinner=False, ttl=60*60*6)
 def fetch_fundamentals(symbol: str) -> Dict[str, Optional[float]]:
-    """
-    yfinance info can be missing; this must never crash the scan.
-    """
     fields = {
         "marketCap": None,
         "averageVolume": None,
@@ -429,9 +479,6 @@ def fetch_fundamentals(symbol: str) -> Dict[str, Optional[float]]:
         return fields
 
 def fundamentals_qc(symbol: str, fields: Dict[str, Optional[float]], qc: dict) -> FundamentalResult:
-    """
-    Hard QC gates + a simple score out of 100.
-    """
     reasons = []
     mcap = fields.get("marketCap")
     avgv = fields.get("averageVolume")
@@ -441,18 +488,13 @@ def fundamentals_qc(symbol: str, fields: Dict[str, Optional[float]], qc: dict) -
     de  = fields.get("debtToEquity")
     fcf = fields.get("freeCashflow")
 
-    # Liquidity gates
-    # We'll estimate avg $ volume using avgVolume * lastClose later if needed; here gate on avgVolume itself.
     if mcap is not None and mcap < qc["min_market_cap"]:
         reasons.append(f"Market cap < ${qc['min_market_cap']/1e9:.1f}B")
 
     if avgv is not None and avgv < qc["min_avg_volume"]:
         reasons.append(f"Avg volume < {qc['min_avg_volume']:,}/day")
 
-    # Profitability / quality gate (soft-ish but still QC)
-    # If we have margins: require at least not terrible
     if qc["require_profitability"]:
-        # Accept if any: operating margin positive OR profit margin positive OR FCF positive
         ok_profit = False
         if opm is not None and opm > 0:
             ok_profit = True
@@ -463,24 +505,19 @@ def fundamentals_qc(symbol: str, fields: Dict[str, Optional[float]], qc: dict) -
         if not ok_profit:
             reasons.append("No positive profitability/FCF signal")
 
-    # Debt sanity gate
     if qc["max_debt_to_equity"] is not None and de is not None and de > qc["max_debt_to_equity"]:
         reasons.append(f"Debt/Equity > {qc['max_debt_to_equity']}")
 
     ok = len(reasons) == 0
 
-    # Score (0–100). Missing data doesn't zero you out; it just gives less points.
     score = 0
-    # Liquidity points
     if mcap is not None:
         score += 20 if mcap >= qc["min_market_cap"] else 5
     if avgv is not None:
         score += 20 if avgv >= qc["min_avg_volume"] else 5
-
-    # Growth points
     if revg is not None:
         score += 20 if revg > 0 else 5
-    # Profitability points
+
     best_margin = None
     if opm is not None:
         best_margin = opm
@@ -488,14 +525,14 @@ def fundamentals_qc(symbol: str, fields: Dict[str, Optional[float]], qc: dict) -
         best_margin = max(best_margin, pm) if best_margin is not None else pm
     if best_margin is not None:
         score += 20 if best_margin > 0 else 5
-    # Debt points
+
     if de is not None:
         score += 20 if de <= (qc["max_debt_to_equity"] if qc["max_debt_to_equity"] is not None else de) else 5
 
+    # if some fields are missing, you still end up ~40–60, not 0
     score = int(max(0, min(100, score)))
 
     return FundamentalResult(symbol=symbol, ok=ok, fund_score=score, qc_fail_reasons=reasons, fields=fields)
-
 
 # =========================
 # Trading / sizing helpers
@@ -506,7 +543,7 @@ def tv_symbol(symbol: str, prefix: str) -> str:
 @dataclass
 class FinalRow:
     symbol: str
-    status: str  # READY / WATCHLIST / PASS / QC_FAIL / SKIP_RISK_CAP / SKIP_NO_SHARES
+    status: str
     score_tech: int
     score_fund: int
     score_total: int
@@ -522,7 +559,6 @@ class FinalRow:
     box_low: Optional[float]
     reason: str
 
-
 # =========================
 # Sidebar controls
 # =========================
@@ -530,7 +566,17 @@ st.sidebar.header("🧰 Universe (Full Exchange Supported)")
 
 universe_mode = st.sidebar.selectbox(
     "Universe Source",
-    ["AUTO: S&P 500", "AUTO: Nasdaq-100", "AUTO: Russell 1000", "AUTO: NASDAQ (All)", "AUTO: NYSE (All)", "AUTO: AMEX (All)", "AUTO: ALL US (NASDAQ+NYSE+AMEX)", "Paste tickers", "Upload tickers file"],
+    [
+        "AUTO: S&P 500",
+        "AUTO: Nasdaq-100",
+        "AUTO: Russell 1000",
+        "AUTO: NASDAQ (All)",
+        "AUTO: NYSE (All)",
+        "AUTO: AMEX (All)",
+        "AUTO: ALL US (NASDAQ+NYSE+AMEX)",
+        "Paste tickers",
+        "Upload tickers file",
+    ],
     index=0
 )
 
@@ -564,7 +610,7 @@ qc["min_avg_volume"] = {"200k":200_000,"500k":500_000,"1M":1_000_000,"2M":2_000_
 qc["require_profitability"] = st.sidebar.checkbox("Require profitability/FCF signal", value=True)
 qc["max_debt_to_equity"] = st.sidebar.selectbox("Max Debt/Equity (if available)", ["No limit", "2.0", "1.5", "1.0"], index=1)
 qc["max_debt_to_equity"] = None if qc["max_debt_to_equity"] == "No limit" else float(qc["max_debt_to_equity"])
-fund_weight = st.sidebar.slider("Fundamentals weight (Total Score)", 0, 40, 20, 5)  # default 20%
+fund_weight = st.sidebar.slider("Fundamentals weight (Total Score)", 0, 40, 20, 5)
 tech_weight = 100 - fund_weight
 st.sidebar.caption(f"Total Score = {tech_weight}% Tech + {fund_weight}% Fundamentals")
 
@@ -594,7 +640,7 @@ st.sidebar.caption("Full-exchange scans are heavy. This design scans tech first,
 # =========================
 # Universe selection
 # =========================
-tickers = []
+tickers: List[str] = []
 
 if universe_mode == "AUTO: S&P 500":
     tickers = load_sp500()
@@ -614,23 +660,23 @@ elif universe_mode == "Paste tickers":
     pasted = st.sidebar.text_area("Paste tickers", value="AAPL MSFT NVDA AMD GOOGL META", height=120)
     tickers = parse_tickers(pasted)
 else:
-    up = st.sidebar.file_uploader("Upload .txt or .csv", type=["txt","csv"])
+    up = st.sidebar.file_uploader("Upload .txt or .csv", type=["txt", "csv"])
     if up is not None:
         raw = up.read()
         try:
-            df = pd.read_csv(io.BytesIO(raw))
-            col = df.columns[0]
-            if "symbol" in [c.lower() for c in df.columns.astype(str).tolist()]:
-                for c in df.columns:
+            dfu = pd.read_csv(io.BytesIO(raw))
+            col = dfu.columns[0]
+            if "symbol" in [c.lower() for c in dfu.columns.astype(str).tolist()]:
+                for c in dfu.columns:
                     if str(c).lower() == "symbol":
                         col = c
                         break
-            tickers = parse_tickers("\n".join(df[col].astype(str).tolist()))
+            tickers = parse_tickers("\n".join(dfu[col].astype(str).tolist()))
         except Exception:
             tickers = parse_tickers(raw.decode("utf-8", errors="ignore"))
 
 tickers = [t for t in tickers if t]
-tickers = list(dict.fromkeys(tickers))  # dedupe stable
+tickers = list(dict.fromkeys(tickers))  # stable dedupe
 
 if len(tickers) > int(max_tickers):
     tickers = tickers[: int(max_tickers)]
@@ -663,14 +709,11 @@ status = st.empty()
 results: List[ScanResult] = []
 
 def download_batch(symbols: List[str]) -> Dict[str, pd.DataFrame]:
-    """
-    Use yfinance multi-download to reduce requests.
-    Returns dict symbol -> df_weekly.
-    """
-    out = {}
+    out: Dict[str, pd.DataFrame] = {}
+    if not symbols:
+        return out
     s = " ".join(symbols)
     try:
-        # 5y gives enough weeks for MA + box + lookback.
         data = yf.download(
             tickers=s,
             period="5y",
@@ -683,18 +726,16 @@ def download_batch(symbols: List[str]) -> Dict[str, pd.DataFrame]:
         if data is None or data.empty:
             return out
 
-        # Single ticker returns columns directly; multi returns multiindex
         if isinstance(data.columns, pd.MultiIndex):
             for sym in symbols:
                 if sym in data.columns.get_level_values(0):
-                    df = data[sym].dropna()
-                    if not df.empty and {"Open","High","Low","Close","Volume"}.issubset(df.columns):
-                        out[sym] = df.copy()
+                    dfw = data[sym].dropna()
+                    if not dfw.empty and {"Open", "High", "Low", "Close", "Volume"}.issubset(dfw.columns):
+                        out[sym] = dfw.copy()
         else:
-            df = data.dropna()
-            if not df.empty and {"Open","High","Low","Close","Volume"}.issubset(df.columns):
-                out[symbols[0]] = df.copy()
-
+            dfw = data.dropna()
+            if not dfw.empty and {"Open", "High", "Low", "Close", "Volume"}.issubset(dfw.columns):
+                out[symbols[0]] = dfw.copy()
     except Exception:
         return out
     return out
@@ -704,13 +745,13 @@ total_batches = len(batches)
 
 def process_batch(symbols: List[str]) -> List[ScanResult]:
     dfs = download_batch(symbols)
-    local = []
+    local: List[ScanResult] = []
     for sym in symbols:
-        df = dfs.get(sym)
-        if df is None or df.empty:
+        dfw = dfs.get(sym)
+        if dfw is None or dfw.empty:
             local.append(ScanResult(sym, "PASS", 0, None, None, None, [], [f"No weekly data for {sym}"], {}))
         else:
-            local.append(eval_fw_technical(sym, df, cfg))
+            local.append(eval_fw_technical(sym, dfw, cfg))
     return local
 
 done = 0
@@ -719,7 +760,7 @@ with ThreadPoolExecutor(max_workers=int(max_workers)) as ex:
     for fut in as_completed(futs):
         try:
             batch_res = fut.result()
-        except Exception as e:
+        except Exception:
             batch_res = []
         results.extend(batch_res)
         done += 1
@@ -729,19 +770,16 @@ with ThreadPoolExecutor(max_workers=int(max_workers)) as ex:
 status.write("✅ Technical scan complete.")
 progress.empty()
 
-# Sort technical: BUY first, then score desc
 results.sort(key=lambda r: (0 if r.decision_base == "BUY" else 1, -r.score_tech, r.symbol))
 
-# shortlist for fundamentals (BUY first + top scores)
 shortlist_syms = [r.symbol for r in results if r.decision_base == "BUY"]
 if len(shortlist_syms) < int(fund_top_n):
-    # top by score even if PASS (to allow candidates to be inspected)
     add = [r.symbol for r in results if r.symbol not in shortlist_syms][: (int(fund_top_n) - len(shortlist_syms))]
     shortlist_syms.extend(add)
 shortlist_syms = shortlist_syms[: int(fund_top_n)]
 
 # =========================
-# Phase 2: Fundamentals QC (on shortlist)
+# Phase 2: Fundamentals QC (Shortlist only)
 # =========================
 st.subheader("2) Fundamentals QC + Scoring (Applied to Shortlist)")
 fund_map: Dict[str, FundamentalResult] = {}
@@ -786,83 +824,69 @@ for r in results:
     if search and search not in r.symbol.upper():
         continue
 
-    # fundamentals (if missing => neutral)
     fr = fund_map.get(r.symbol)
-    fund_ok = True
     fund_score = 50
     qc_reason = ""
     if qc["enable_fundamentals"]:
         if fr is not None:
-            fund_ok = fr.ok
             fund_score = fr.fund_score
             if not fr.ok:
                 qc_reason = " | ".join(fr.qc_fail_reasons)
-        else:
-            # not in shortlist => don't punish, but don't promote strongly either
-            fund_ok = True
-            fund_score = 50
 
-    # Combine score
-    total_score = int(round((r.score_tech * (tech_weight/100.0)) + (fund_score * (fund_weight/100.0))))
+    total_score = int(round((r.score_tech * (tech_weight / 100.0)) + (fund_score * (fund_weight / 100.0))))
 
-    # Base status
     if r.decision_base != "BUY":
-        status = "PASS"
+        status_lbl = "PASS"
         reason = "Failed one or more technical FW gates."
     else:
-        # weekly confirmation
         if not confirmed_now:
-            status = "WATCHLIST"
+            status_lbl = "WATCHLIST"
             reason = "Weekly close not confirmed yet. Confirm after Friday close."
         else:
-            status = "WATCHLIST"
+            status_lbl = "WATCHLIST"
             reason = "Meets technical gates; pending sizing/QC."
 
-    # Fundamentals QC can downgrade BUY/WATCHLIST to QC_FAIL
     if r.decision_base == "BUY" and qc["enable_fundamentals"] and (fr is not None) and (not fr.ok) and confirmed_now:
-        status = "QC_FAIL"
+        status_lbl = "QC_FAIL"
         reason = f"Fundamentals QC fail: {qc_reason}"
 
     shares = 0
     position_value = 0.0
     risk_dollars = 0.0
 
-    # Only size READY candidates (confirmed, technical BUY, not QC_FAIL)
-    if r.decision_base == "BUY" and confirmed_now and status not in ("QC_FAIL", "PASS"):
+    if r.decision_base == "BUY" and confirmed_now and status_lbl not in ("QC_FAIL", "PASS"):
         if r.entry is not None and r.stop is not None and r.entry > r.stop:
             per_share_risk = r.entry - r.stop
             shares = int(risk_dollars_per_trade // per_share_risk)
             if shares <= 0:
-                status = "SKIP_NO_SHARES"
+                status_lbl = "SKIP_NO_SHARES"
                 reason = "Per-share risk too large for your risk-per-trade."
             else:
                 position_value = shares * r.entry
                 risk_dollars = shares * per_share_risk
 
-                # Portfolio risk cap + max positions
                 if new_positions_used >= int(max_new_positions):
-                    status = "SKIP_RISK_CAP"
+                    status_lbl = "SKIP_RISK_CAP"
                     reason = "Max new positions reached."
                 elif (portfolio_risk_used + risk_dollars) > max_portfolio_risk_dollars:
-                    status = "SKIP_RISK_CAP"
+                    status_lbl = "SKIP_RISK_CAP"
                     reason = "Would exceed portfolio risk cap."
                 else:
-                    # READY
-                    status = "READY"
+                    status_lbl = "READY"
                     reason = "Meets FW tech + timing + (optional) fundamentals + sizing + risk cap."
                     portfolio_risk_used += risk_dollars
                     new_positions_used += 1
         else:
-            status = "WATCHLIST"
+            status_lbl = "WATCHLIST"
             reason = "No valid structured stop for sizing."
 
-    if show_ready_only and status != "READY":
+    if show_ready_only and status_lbl != "READY":
         continue
 
     m = r.metrics or {}
     rows.append(FinalRow(
         symbol=r.symbol,
-        status=status,
+        status=status_lbl,
         score_tech=r.score_tech,
         score_fund=fund_score,
         score_total=total_score,
@@ -879,8 +903,7 @@ for r in results:
         reason=reason
     ))
 
-# Sort final rows: READY first, then total score desc
-order = {"READY":0, "WATCHLIST":1, "QC_FAIL":2, "SKIP_RISK_CAP":3, "SKIP_NO_SHARES":4, "PASS":5}
+order = {"READY": 0, "WATCHLIST": 1, "QC_FAIL": 2, "SKIP_RISK_CAP": 3, "SKIP_NO_SHARES": 4, "PASS": 5}
 rows.sort(key=lambda x: (order.get(x.status, 9), -x.score_total, x.symbol))
 
 # =========================
