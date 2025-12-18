@@ -323,11 +323,32 @@ def evaluate_fw(symbol: str, df_weekly: pd.DataFrame, cfg: dict) -> ScanResult:
 # =========================
 # Universe options (starter)
 # =========================
-STARTER_UNIVERSES = {
-    "Starter Tech (NASDAQ)": ["NVDA", "MSFT", "AMD", "AAPL", "GOOGL", "META"],
-    "Starter Blue Chips (NYSE)": ["NKE", "KO", "JPM", "JNJ", "XOM", "DIS"],
-    "Starter ETFs": ["SPY", "QQQ", "IWM", "XLK", "XLE", "XLF"],
+  STARTER_UNIVERSES = {
+    # --- TECH ---
+    "Tech (NASDAQ)": ["NVDA", "MSFT", "AMD", "AAPL", "GOOGL", "META"],
+
+    # --- ENERGY ---
+    "Energy": ["XOM", "CVX", "COP", "SLB", "OXY"],
+
+    # --- FINANCIALS ---
+    "Financials": ["JPM", "BAC", "GS", "MS", "C"],
+
+    # --- HEALTHCARE ---
+    "Healthcare": ["JNJ", "UNH", "LLY", "PFE", "MRK"],
+
+    # --- INDUSTRIALS ---
+    "Industrials": ["CAT", "DE", "HON", "GE", "BA"],
+
+    # --- DEFENSE ---
+    "Defense": ["LMT", "NOC", "RTX", "GD"],
+
+    # --- RETAIL ---
+    "Retail": ["WMT", "COST", "TGT", "HD", "LOW"],
+
+    # --- ETFs ---
+    "ETFs (Market)": ["SPY", "QQQ", "IWM", "XLK", "XLE", "XLF"],
 }
+
 
 def parse_tickers(text: str) -> List[str]:
     if not text:
