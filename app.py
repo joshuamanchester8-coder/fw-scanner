@@ -1,58 +1,48 @@
+
 import streamlit as st
 import yfinance as yf
 import pandas as pd
 import pandas_ta as ta
 import requests
+import time
 
 # --- PAGE CONFIGURATION ---
 st.set_page_config(page_title="FW Protocol Scanner", page_icon="🦅", layout="wide")
 
-st.title("Financial Wisdom Market Scanner 🦅")
+# --- HEADER & SIDEBAR ---
+st.title("Financial Wisdom Protocol Scanner 🦅")
+st.markdown("---")
 
-# --- DROPDOWN MENUS ---
 col1, col2 = st.columns(2)
 
 with col1:
-    universe = st.selectbox(
+    universe_selection = st.selectbox(
         "1. Select Market Universe:",
-        ("S&P 500 (Large Cap)", "S&P 400 (Mid Cap)", "S&P 600 (Small Cap)", "S&P 1500 (All Quality)", "Nasdaq 100 (Tech & Growth)")
+        ("S&P 500 (Large Cap)", "S&P 400 (Mid Cap)", "S&P 600 (Small Cap)", "S&P 1500 (All Quality)", "Nasdaq 100 (Tech)")
     )
 
 with col2:
-    scan_mode = st.selectbox(
-        "2. Select Strategy:",
+    strategy_mode = st.selectbox(
+        "2. Select Strategy Mode:",
         ("Standard Scan (Layer A - Setups)", "Sniper Scan (Green Label - Breakouts)")
     )
 
-st.info(f"Ready to scan **{universe}** using **{scan_mode}** logic.")
+# --- HELPER FUNCTIONS ---
 
-# --- DATA FUNCTIONS ---
 @st.cache_data(ttl=86400)
 def get_tickers(selection):
+    """
+    Scrapes Wikipedia for ticker lists based on selection.
+    Handles symbol cleaning (dots to hyphens).
+    """
     headers = {"User-Agent": "Mozilla/5.0"}
     tickers = []
     
     try:
-        # 1. S&P 500
-        if "500" in selection or "1500" in selection:
-            url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
-            tickers.extend(pd.read_html(requests.get(url, headers=headers).text)[0]['Symbol'].tolist())
-            
-        # 2. S&P 400
-        if "400" in selection or "1500" in selection:
-            url = 'https://en.wikipedia.org/wiki/List_of_S%26P_400_companies'
-            tickers.extend(pd.read_html(requests.get(url, headers=headers).text)[0]['Symbol'].tolist())
-
-        # 3. S&P 600
-        if "600" in selection or "1500" in selection:
-            url = 'https://en.wikipedia.org/wiki/List_of_S%26P_600_companies'
-            tickers.extend(pd.read_html(requests.get(url, headers=headers).text)[0]['Symbol'].tolist())
-
-        # 4. Nasdaq 100 (NEW)
+        # Nasdaq 100
         if "Nasdaq" in selection:
             url = 'https://en.wikipedia.org/wiki/Nasdaq-100'
             dfs = pd.read_html(requests.get(url, headers=headers).text)
-            # Find the table with 'Ticker' or 'Symbol'
             for df in dfs:
                 if 'Ticker' in df.columns:
                     tickers.extend(df['Ticker'].tolist())
@@ -60,150 +50,208 @@ def get_tickers(selection):
                 elif 'Symbol' in df.columns:
                     tickers.extend(df['Symbol'].tolist())
                     break
-
-        # Clean tickers
-        tickers = list(set([t.replace('.', '-') for t in tickers]))
-        return tickers
         
+        # S&P Indices
+        else:
+            if "500" in selection or "1500" in selection:
+                url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
+                tickers.extend(pd.read_html(requests.get(url, headers=headers).text)[0]['Symbol'].tolist())
+            
+            if "400" in selection or "1500" in selection:
+                url = 'https://en.wikipedia.org/wiki/List_of_S%26P_400_companies'
+                tickers.extend(pd.read_html(requests.get(url, headers=headers).text)[0]['Symbol'].tolist())
+
+            if "600" in selection or "1500" in selection:
+                url = 'https://en.wikipedia.org/wiki/List_of_S%26P_600_companies'
+                tickers.extend(pd.read_html(requests.get(url, headers=headers).text)[0]['Symbol'].tolist())
+
+        # Clean Tickers (BRK.B -> BRK-B for Yahoo Finance)
+        clean_tickers = list(set([t.replace('.', '-') for t in tickers]))
+        return clean_tickers
+
     except Exception as e:
-        st.error(f"Error fetching tickers: {e}")
+        st.error(f"Data Source Error: {e}")
         return []
 
-# --- LOGIC 1: STANDARD (LAYER A - SETUP) ---
-def check_layer_a(ticker):
+def analyze_stock(ticker, mode):
+    """
+    Fetches 2y Weekly Data via yfinance.
+    Applies strict FW Protocol Rules.
+    Returns dictionary with Pass/Fail and reasons.
+    """
     try:
+        # 1. FETCH DATA (Yahoo Finance Source)
         stock = yf.Ticker(ticker)
         df = stock.history(period="2y", interval="1wk")
-        if len(df) < 52: return None
+        
+        if len(df) < 52: 
+            return None
 
-        # Indicators
+        # 2. CALCULATE INDICATORS
+        # Trend
         df['SMA_20'] = ta.sma(df['Close'], length=20)
         df['SMA_50'] = ta.sma(df['Close'], length=50)
+        
+        # Volatility (NATR)
         df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], length=14)
         df['NATR'] = (df['ATR'] / df['Close']) * 100
         
         # MACD
         macd = ta.macd(df['Close'])
+        if macd is None: return None
         df['MACD_Line'] = macd['MACD_12_26_9']
         df['MACD_Signal'] = macd['MACDs_12_26_9']
 
-        curr = df.iloc[-1]
-
-        # RULES
-        trend = (curr['Close'] > curr['SMA_20']) and (curr['Close'] > curr['SMA_50'])
-        alignment = curr['SMA_20'] > curr['SMA_50']
-        
-        if len(df) >= 4:
-            consolidation = df['NATR'].iloc[-5:-1].mean() < 8 
-        else:
-            consolidation = False
-            
-        momentum = curr['MACD_Line'] > curr['MACD_Signal']
-
-        if trend and alignment and consolidation and momentum:
-            return {
-                'Ticker': ticker,
-                'Price': round(curr['Close'], 2),
-                'NATR %': round(curr['NATR'], 2),
-                'Trend': "Strong"
-            }
-        return None
-    except:
-        return None
-
-# --- LOGIC 2: SNIPER (GREEN LABEL - BREAKOUT) ---
-def check_sniper(ticker):
-    try:
-        stock = yf.Ticker(ticker)
-        df = stock.history(period="2y", interval="1wk")
-        if len(df) < 52: return None
-
-        # Indicators
-        df['SMA_20'] = ta.sma(df['Close'], length=20)
-        df['SMA_50'] = ta.sma(df['Close'], length=50)
-        df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], length=14)
-        df['NATR'] = (df['ATR'] / df['Close']) * 100
-        
-        # Box High
+        # Box / Breakout Levels
+        # Highest High of the last 12 weeks (Shifted 1 to exclude current week)
         df['Box_High'] = df['High'].rolling(12).max().shift(1)
-        
-        # MACD
-        macd = ta.macd(df['Close'])
-        df['MACD_Line'] = macd['MACD_12_26_9']
-        df['MACD_Signal'] = macd['MACDs_12_26_9']
+        df['Box_Low'] = df['Low'].rolling(12).min().shift(1)
 
+        # Current Candle
         curr = df.iloc[-1]
         prev = df.iloc[-2]
 
-        # RULES
-        trend = (curr['Close'] > curr['SMA_20']) and (curr['SMA_20'] > curr['SMA_50'])
-        tight = df['NATR'].iloc[-5:-1].mean() < 8 
+        # 3. APPLY RULES (The Verdict Logic)
+        reasons = []
+        is_valid = True
+
+        # Rule A: Trend
+        if curr['Close'] > curr['SMA_20']:
+            # reasons.append("Trend OK") # Too verbose, implied
+            pass
+        else:
+            is_valid = False
+            reasons.append("Price below 20 SMA")
+
+        # Rule B: Tightness (Consolidation)
+        # Average NATR of last 4 closed weeks
+        avg_natr = df['NATR'].iloc[-5:-1].mean()
+        if avg_natr < 8:
+            pass
+        else:
+            is_valid = False
+            reasons.append(f"Base too loose (NATR {round(avg_natr, 1)}%)")
+
+        # Rule C: Momentum (MACD)
+        if curr['MACD_Line'] > curr['MACD_Signal']:
+            pass
+        else:
+            # We allow entering if MACD is just turning, but prefer bullish
+            # is_valid = False # Strict rule? Let's keep it soft for Standard scan
+            reasons.append("MACD Bearish")
+
+        # --- MODE SPECIFIC RULES ---
         
-        if not (trend and tight): return None
+        if "Sniper" in mode:
+            # 1. Breakout Check
+            if curr['Close'] > curr['Box_High']:
+                reasons.append("BREAKOUT")
+            else:
+                is_valid = False
+                # No reason needed, simply not a result
+            
+            # 2. Volume Spike
+            vol_change = ((curr['Volume'] / prev['Volume']) - 1) * 100
+            if vol_change > 30:
+                reasons.append(f"Vol Spike +{int(vol_change)}%")
+            else:
+                is_valid = False
+                # reasons.append(f"Low Vol (+{int(vol_change)}%)")
 
-        # Breakout Details
-        breakout = curr['Close'] > curr['Box_High']
-        volume = curr['Volume'] > (prev['Volume'] * 1.3)
-        
-        rng = curr['High'] - curr['Low']
-        wick = (curr['High'] - max(curr['Open'], curr['Close']))
-        clean_candle = (wick / rng) < 0.50 if rng > 0 else False
+            # 3. Wick Check
+            range_len = curr['High'] - curr['Low']
+            upper_wick = curr['High'] - max(curr['Open'], curr['Close'])
+            if range_len > 0 and (upper_wick / range_len) > 0.5:
+                is_valid = False
+                # reasons.append("Wick > 50%")
 
-        macd_bull = curr['MACD_Line'] > curr['MACD_Signal']
-
-        if breakout and volume and clean_candle and macd_bull:
+        # Final Formatting
+        if is_valid:
+            # Calculate Risk
+            risk_pct = ((curr['Close'] - curr['Box_Low']) / curr['Close']) * 100
+            
             return {
-                'Ticker': ticker,
-                'Price': round(curr['Close'], 2),
-                'Vol Spike': f"{round(((curr['Volume']/prev['Volume'])-1)*100, 1)}%",
-                'NATR': round(curr['NATR'], 2)
+                "Ticker": ticker,
+                "Price": round(curr['Close'], 2),
+                "Risk": f"{round(risk_pct, 1)}%",
+                "NATR": round(curr['NATR'], 2),
+                "Vol Spike": f"+{int(((curr['Volume']/prev['Volume'])-1)*100)}%" if "Sniper" in mode else "N/A",
+                "Notes": ", ".join(reasons) if reasons else "Clean Setup"
             }
-        return None
-    except:
+        
         return None
 
-# --- EXECUTION ---
-if st.button("🚀 RUN SCAN"):
-    tickers = get_tickers(universe)
+    except Exception:
+        return None
+
+# --- EXECUTION LOGIC ---
+
+if st.button("🚀 INITIATE SCAN"):
     
-    if not tickers: 
-        st.stop()
-    
-    st.write(f"Loading {len(tickers)} stocks... (This may take a few minutes)")
-    
-    progress = st.progress(0)
-    status = st.empty()
-    results = []
-    
-    for i, ticker in enumerate(tickers):
-        if i % 10 == 0: 
-            progress.progress((i+1)/len(tickers))
-            status.text(f"Scanning: {ticker}")
+    # 1. Get Universe
+    with st.status("Initializing Data Protocol...", expanded=True) as status:
+        st.write(f"Connecting to Wikipedia source for {universe_selection}...")
+        tickers = get_tickers(universe_selection)
+        
+        if not tickers:
+            st.error("Failed to retrieve ticker list.")
+            st.stop()
             
-        if "Standard" in scan_mode:
-            data = check_layer_a(ticker)
-        else:
-            data = check_sniper(ticker)
+        st.write(f"Successfully retrieved {len(tickers)} symbols.")
+        st.write("Cleaning symbols for Yahoo Finance compatibility...")
+        
+        st.write(f"Beginning Analysis ({strategy_mode})...")
+        
+        # 2. Run Scan
+        results = []
+        progress_bar = st.progress(0)
+        log_placeholder = st.empty()
+        
+        start_time = time.time()
+        
+        for i, ticker in enumerate(tickers):
+            # Update UI every 5 ticks to save resources
+            if i % 5 == 0:
+                progress_bar.progress((i + 1) / len(tickers))
+                log_placeholder.code(f"Scanning: {ticker} | Found: {len(results)}")
             
-        if data: results.append(data)
-            
-    progress.empty()
-    status.empty()
-    
-    # --- OUTPUT ---
+            data = analyze_stock(ticker, strategy_mode)
+            if data:
+                results.append(data)
+                
+        progress_bar.empty()
+        log_placeholder.empty()
+        status.update(label="Scan Complete!", state="complete", expanded=False)
+
+    # 3. Display Results
     if results:
-        df_results = pd.DataFrame(results)
+        st.success(f"✅ SCAN COMPLETE. Found {len(results)} Candidates.")
         
-        if "Standard" in scan_mode:
-            st.success(f"✅ Found {len(results)} Candidates")
-            df_results = df_results.sort_values(by="NATR %")
+        df = pd.DataFrame(results)
+        
+        # Sort by best criteria
+        if "Sniper" in strategy_mode:
+            # For Sniper, we usually want to see them all, maybe sort by Volume
+            pass 
         else:
-            st.balloons()
-            st.success(f"🔥 FOUND {len(results)} BREAKOUTS")
-            
-        st.dataframe(df_results, use_container_width=True)
+            # For Standard, sort by Tightness (NATR)
+            df = df.sort_values(by="NATR")
+
+        st.dataframe(
+            df,
+            column_config={
+                "Ticker": st.column_config.TextColumn("Symbol", help="Stock Ticker"),
+                "Price": st.column_config.NumberColumn("Price", format="$%.2f"),
+                "Risk": st.column_config.TextColumn("Risk %", help="Distance to Stop Loss"),
+                "NATR": st.column_config.NumberColumn("Tightness", help="Lower is Better (<8)", format="%.2f%%"),
+            },
+            use_container_width=True,
+            hide_index=True
+        )
         
-        st.subheader("📋 Copy List for TradingView")
-        st.code(",".join(df_results['Ticker'].tolist()))
+        # 4. Copy Paste Area
+        st.markdown("### 📋 Copy for TradingView")
+        st.code(",".join(df['Ticker'].tolist()))
+        
     else:
-        st.warning("No stocks matched the criteria.")
+        st.warning("No stocks matched the strict Financial Wisdom criteria this week.")
