@@ -323,7 +323,7 @@ def evaluate_fw(symbol: str, df_weekly: pd.DataFrame, cfg: dict) -> ScanResult:
 # =========================
 # Universe options (starter)
 # =========================
-  STARTER_UNIVERSES = {
+  STARTER_UNIVERSES =
     # --- TECH ---
     "Tech (NASDAQ)": ["NVDA", "MSFT", "AMD", "AAPL", "GOOGL", "META"],
 
