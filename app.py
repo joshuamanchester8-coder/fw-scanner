@@ -20,24 +20,25 @@ except Exception:
 # ============================================================
 
 st.set_page_config(
-    page_title="Financial Wisdom Exact Scanner",
+    page_title="Financial Wisdom Clean Scanner",
     page_icon="📈",
     layout="wide"
 )
 
-st.title("📈 Financial Wisdom Exact Breakout Scanner")
+st.title("📈 Financial Wisdom Clean Breakout Scanner")
 st.caption(
-    "Pure FW weekly breakout scanner: 20W MA + MACD + NATR + consolidation breakout + volume + candle quality + quality fundamentals."
+    "Broad clean-stock scanner. Shows only FW technical pass candidates, then fundamental pass/fail if available."
 )
 
 
 # ============================================================
-# CONSTANTS — TRUE FW RULES
+# EXACT FW CONSTANTS
 # ============================================================
 
 FW_MA_WEEKS = 20
 FW_MIN_CONSOLIDATION_WEEKS = 6
 FW_HIGH_CLOSE_LOOKBACK = 10
+
 FW_NATR_MAX = 8.0
 FW_MIN_VOLUME_SPIKE_PCT = 30.0
 FW_MIN_BREAKOUT_PCT = 5.0
@@ -49,8 +50,7 @@ FW_MIN_ROC = 0.10
 FW_MIN_ROE = 0.10
 FW_MIN_OPERATING_MARGIN = 0.10
 
-FW_POSITION_SIZE_PCT = 0.16  # FW example uses 16% position size from fractional Kelly
-
+FW_POSITION_SIZE_PCT = 0.16
 
 HEADERS = {
     "User-Agent": (
@@ -62,7 +62,7 @@ HEADERS = {
 
 
 # ============================================================
-# DATA STRUCTURES
+# DATA CLASSES
 # ============================================================
 
 @dataclass
@@ -80,7 +80,7 @@ class TechnicalResult:
 @dataclass
 class FundamentalResult:
     symbol: str
-    fundamental_pass: bool
+    status: str  # FUND_PASS / FUND_FAIL / FUND_ERROR / FUND_NOT_RUN
     metrics: Dict[str, Optional[float]]
     passed: List[str]
     failed: List[str]
@@ -93,8 +93,8 @@ class FinalResult:
     entry: Optional[float]
     stop: Optional[float]
     stop_risk_pct: Optional[float]
-    position_value: float
     shares: int
+    position_value: float
     risk_dollars: float
     risk_on_equity_pct: float
     technical: TechnicalResult
@@ -115,15 +115,8 @@ def now_eastern() -> datetime:
 
 
 def weekly_close_confirmed() -> bool:
-    """
-    Official FW signal should be confirmed after the weekly candle closes.
-    Conservative rule:
-    - Friday after 4:10 PM ET
-    - Saturday
-    - Sunday
-    """
     t = now_eastern()
-    wd = t.weekday()  # Monday=0, Sunday=6
+    wd = t.weekday()
 
     if wd in (5, 6):
         return True
@@ -135,8 +128,76 @@ def weekly_close_confirmed() -> bool:
 
 
 # ============================================================
-# SYMBOL / UNIVERSE HELPERS
+# SYMBOL CLEANING
 # ============================================================
+
+BAD_SECURITY_KEYWORDS = [
+    "ETF",
+    "ETN",
+    "FUND",
+    "TRUST",
+    "PREFERRED",
+    "PFD",
+    "PRF",
+    "WARRANT",
+    "WARRANTS",
+    "RIGHT",
+    "RIGHTS",
+    "UNIT",
+    "UNITS",
+    "NOTE",
+    "NOTES",
+    "BOND",
+    "DEBENTURE",
+    "ADR EACH",
+    "ADS EACH",
+    "DEPOSITARY",
+    "SPAC",
+    "ACQUISITION CORP UNIT",
+    "ACQUISITION CORP RIGHT",
+    "ACQUISITION CORP WARRANT",
+]
+
+BAD_SYMBOL_SUFFIXES = [
+    "W", "WS", "WT", "WTA", "WTB",
+    "U", "R",
+    "P", "PA", "PB", "PC", "PD", "PE", "PF", "PG", "PH", "PI", "PJ", "PK",
+    "PL", "PM", "PN", "PO", "PP", "PQ", "PR", "PS", "PT", "PU", "PV", "PW", "PX", "PY", "PZ"
+]
+
+
+def looks_like_common_stock(symbol: str, security_name: str = "") -> bool:
+    sym = str(symbol).strip().upper()
+    name = str(security_name).strip().upper()
+
+    if not sym:
+        return False
+
+    if sym in ("N/A", "NA", "NONE", "NAN"):
+        return False
+
+    if "^" in sym or "/" in sym:
+        return False
+
+    if len(sym) > 7:
+        return False
+
+    if not any(ch.isalpha() for ch in sym):
+        return False
+
+    # Symbol suffix filters: catches many preferreds/warrants/units.
+    # Examples: NHPBP, ABC.WS, XYZU, XYZR, etc.
+    for suffix in BAD_SYMBOL_SUFFIXES:
+        if sym.endswith(suffix) and len(sym) >= 5:
+            return False
+
+    # Name keyword filters.
+    for bad in BAD_SECURITY_KEYWORDS:
+        if bad in name:
+            return False
+
+    return True
+
 
 def clean_symbols(symbols: List[str]) -> List[str]:
     cleaned = []
@@ -145,19 +206,7 @@ def clean_symbols(symbols: List[str]) -> List[str]:
     for s in symbols:
         sym = str(s).strip().upper().replace(".", "-")
 
-        if not sym:
-            continue
-
-        if sym in ("N/A", "NA", "NONE", "NAN"):
-            continue
-
-        if "^" in sym or "/" in sym:
-            continue
-
-        if len(sym) > 8:
-            continue
-
-        if not any(ch.isalpha() for ch in sym):
+        if not looks_like_common_stock(sym):
             continue
 
         if sym not in seen:
@@ -178,6 +227,10 @@ def parse_tickers(text: str) -> List[str]:
 def chunked(items: List[str], size: int) -> List[List[str]]:
     return [items[i:i + size] for i in range(0, len(items), size)]
 
+
+# ============================================================
+# UNIVERSE LOADERS
+# ============================================================
 
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 12)
 def load_sp500() -> List[str]:
@@ -201,7 +254,7 @@ def load_sp500() -> List[str]:
         except Exception:
             pass
 
-    st.error("Could not load S&P 500 list. Try another universe or paste tickers manually.")
+    st.error("Could not load S&P 500 list.")
     return []
 
 
@@ -237,15 +290,38 @@ def load_nasdaq100() -> List[str]:
         return clean_symbols(selected[sym_col].astype(str).tolist())
 
     except Exception:
-        st.error("Could not load Nasdaq-100 list. Try another universe or paste tickers manually.")
+        st.error("Could not load Nasdaq-100 list.")
+        return []
+
+
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 12)
+def load_russell1000() -> List[str]:
+    url = "https://raw.githubusercontent.com/rreichel3/US-Stock-Symbols/main/russell1000/russell1000.csv"
+
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=30)
+        r.raise_for_status()
+
+        df = pd.read_csv(io.StringIO(r.text))
+
+        symbol_col = None
+        for c in df.columns:
+            if str(c).lower() in ("symbol", "ticker"):
+                symbol_col = c
+                break
+
+        if symbol_col is None:
+            symbol_col = df.columns[0]
+
+        return clean_symbols(df[symbol_col].astype(str).tolist())
+
+    except Exception:
+        st.error("Could not load Russell 1000 list.")
         return []
 
 
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 12)
 def load_exchange_list(exchange: str) -> List[str]:
-    """
-    Loads NASDAQ / NYSE / AMEX / ALL from NasdaqTrader symbol directories.
-    """
     listed_url = "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt"
     other_url = "https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt"
 
@@ -264,35 +340,52 @@ def load_exchange_list(exchange: str) -> List[str]:
         nasdaq_df = fetch_pipe_file(listed_url)
         other_df = fetch_pipe_file(other_url)
     except Exception:
-        st.error("Could not load exchange symbol lists. Try again later or paste tickers manually.")
+        st.error("Could not load exchange symbol lists.")
         return []
 
     symbols = []
 
     if exchange == "NASDAQ":
-        symbols = nasdaq_df["Symbol"].astype(str).tolist()
+        for _, row in nasdaq_df.iterrows():
+            sym = str(row.get("Symbol", "")).strip().upper()
+            name = str(row.get("Security Name", "")).strip().upper()
+            etf = str(row.get("ETF", "")).strip().upper()
+            test_issue = str(row.get("Test Issue", "")).strip().upper()
+
+            if etf == "Y" or test_issue == "Y":
+                continue
+
+            if looks_like_common_stock(sym, name):
+                symbols.append(sym)
 
     elif exchange in ("NYSE", "AMEX"):
         if "ACT Symbol" in other_df.columns and "Exchange" in other_df.columns:
-            symbols = other_df.loc[
-                other_df["Exchange"].astype(str).str.upper() == exchange,
-                "ACT Symbol"
-            ].astype(str).tolist()
+            filtered = other_df[
+                other_df["Exchange"].astype(str).str.upper() == exchange
+            ]
+
+            for _, row in filtered.iterrows():
+                sym = str(row.get("ACT Symbol", "")).strip().upper()
+                name = str(row.get("Security Name", "")).strip().upper()
+                etf = str(row.get("ETF", "")).strip().upper()
+
+                if etf == "Y":
+                    continue
+
+                if looks_like_common_stock(sym, name):
+                    symbols.append(sym)
 
     elif exchange == "ALL":
-        nasdaq_symbols = nasdaq_df["Symbol"].astype(str).tolist()
-        other_symbols = (
-            other_df["ACT Symbol"].astype(str).tolist()
-            if "ACT Symbol" in other_df.columns
-            else []
-        )
-        symbols = nasdaq_symbols + other_symbols
+        nasdaq_symbols = load_exchange_list("NASDAQ")
+        nyse_symbols = load_exchange_list("NYSE")
+        amex_symbols = load_exchange_list("AMEX")
+        symbols = nasdaq_symbols + nyse_symbols + amex_symbols
 
     return clean_symbols(symbols)
 
 
 # ============================================================
-# INDICATOR CALCULATIONS
+# INDICATORS
 # ============================================================
 
 def sma(series: pd.Series, length: int) -> pd.Series:
@@ -330,9 +423,6 @@ def natr(df: pd.DataFrame, length: int = 14) -> pd.Series:
 # ============================================================
 
 def download_weekly_batch(symbols: List[str]) -> Dict[str, pd.DataFrame]:
-    """
-    Downloads weekly OHLCV for a list of symbols using yfinance.
-    """
     result = {}
 
     if not symbols:
@@ -379,7 +469,7 @@ def download_weekly_batch(symbols: List[str]) -> Dict[str, pd.DataFrame]:
 
 
 # ============================================================
-# TRUE FW TECHNICAL SCAN
+# TECHNICAL EVALUATION
 # ============================================================
 
 def evaluate_technical(symbol: str, df: Optional[pd.DataFrame]) -> TechnicalResult:
@@ -394,10 +484,6 @@ def evaluate_technical(symbol: str, df: Optional[pd.DataFrame]) -> TechnicalResu
     df = df.copy().dropna()
 
     close = df["Close"]
-    high = df["High"]
-    low = df["Low"]
-    open_ = df["Open"]
-    volume = df["Volume"]
 
     current = df.iloc[-1]
     previous = df.iloc[-2]
@@ -413,14 +499,12 @@ def evaluate_technical(symbol: str, df: Optional[pd.DataFrame]) -> TechnicalResu
 
     current_natr = natr(df, 14).iloc[-1]
 
-    # Consolidation box uses prior 6 weeks, excluding breakout candle.
     prior_box = df.iloc[:-1].tail(FW_MIN_CONSOLIDATION_WEEKS)
 
     box_high = float(prior_box["High"].max())
     box_low = float(prior_box["Low"].min())
     box_range = box_high - box_low
 
-    # Stop placement: lower boundary of middle third.
     stop = box_low + (box_range / 3.0)
 
     prior_10w_high_close = float(close.iloc[:-1].tail(FW_HIGH_CLOSE_LOOKBACK).max())
@@ -460,61 +544,51 @@ def evaluate_technical(symbol: str, df: Optional[pd.DataFrame]) -> TechnicalResu
         "stop_risk_pct": stop_risk_pct,
     })
 
-    # Rule 1 — price above 20-week MA
     if ma20 is not None and not pd.isna(ma20) and current_close > ma20:
         passed.append("Price above 20-week MA.")
     else:
         failed.append("Price not above 20-week MA.")
 
-    # Rule 2 — MACD bullish
     if not pd.isna(current_macd) and not pd.isna(current_signal) and current_macd > current_signal:
         passed.append("Weekly MACD line above signal line.")
     else:
         failed.append("Weekly MACD not bullish.")
 
-    # Rule 3 — NATR < 8
     if not pd.isna(current_natr) and current_natr < FW_NATR_MAX:
         passed.append("Weekly NATR under 8.")
     else:
         failed.append("Weekly NATR not under 8.")
 
-    # Rule 4 — minimum 6-week consolidation
     if len(prior_box) >= FW_MIN_CONSOLIDATION_WEEKS and box_range > 0:
         passed.append("Minimum 6-week consolidation box exists.")
     else:
         failed.append("No valid 6-week consolidation box.")
 
-    # Rule 5 — breakout above resistance and close above resistance
     if current_close > box_high:
         passed.append("Weekly close above consolidation resistance.")
     else:
         failed.append("Weekly close not above consolidation resistance.")
 
-    # Rule 6 — 10-week closing high
     if current_close > prior_10w_high_close:
         passed.append("Breakout candle is a 10-week closing high.")
     else:
         failed.append("Breakout candle is not a 10-week closing high.")
 
-    # Rule 7 — volume spike >= 30%
     if volume_spike_pct is not None and volume_spike_pct >= FW_MIN_VOLUME_SPIKE_PCT:
         passed.append("Volume spike at least 30% above prior week.")
     else:
         failed.append("Volume spike less than 30% above prior week.")
 
-    # Rule 8 — breakout candle size 5% to 20%
     if FW_MIN_BREAKOUT_PCT < breakout_pct < FW_MAX_BREAKOUT_PCT:
         passed.append("Breakout size between 5% and 20%.")
     else:
         failed.append("Breakout size not between 5% and 20%.")
 
-    # Rule 9 — upper wick <= 50%
     if upper_wick_pct <= FW_MAX_UPPER_WICK_PCT:
         passed.append("Upper wick is 50% or less.")
     else:
         failed.append("Upper wick greater than 50%.")
 
-    # Rule 10 — stop loss less than 20%
     if stop_risk_pct is not None and stop_risk_pct < FW_MAX_STOP_RISK_PCT:
         passed.append("Stop risk under 20%.")
     else:
@@ -587,7 +661,6 @@ def fetch_fundamentals(symbol: str) -> FundamentalResult:
 
     try:
         ticker = yf.Ticker(symbol)
-
         info = getattr(ticker, "info", {}) or {}
 
         roe = safe_num(info.get("returnOnEquity"))
@@ -632,7 +705,6 @@ def fetch_fundamentals(symbol: str) -> FundamentalResult:
         if operating_income is not None and total_equity is not None:
             debt = total_debt if total_debt is not None else 0.0
             cash_value = cash if cash is not None else 0.0
-
             invested_capital = total_equity + debt - cash_value
 
             if invested_capital > 0:
@@ -650,52 +722,52 @@ def fetch_fundamentals(symbol: str) -> FundamentalResult:
             "cash": cash,
         })
 
-        # FW fundamental rule 1 — ROC > 10%
         if roc is not None and roc > FW_MIN_ROC:
             passed.append("ROC above 10%.")
         else:
             failed.append("ROC not above 10% or unavailable.")
 
-        # FW fundamental rule 2 — ROE > 10%
         if roe is not None and roe > FW_MIN_ROE:
             passed.append("ROE above 10%.")
         else:
             failed.append("ROE not above 10% or unavailable.")
 
-        # FW fundamental rule 3 — Operating margin > 10%
         if operating_margin is not None and operating_margin > FW_MIN_OPERATING_MARGIN:
             passed.append("Operating margin above 10%.")
         else:
             failed.append("Operating margin not above 10% or unavailable.")
 
-        # FW fundamental rule 4 — Revenue positive
         if revenue is not None and revenue > 0:
             passed.append("Revenue positive.")
         else:
             failed.append("Revenue not positive or unavailable.")
 
-        # FW fundamental rule 5 — Net profit positive
         if net_income is not None and net_income > 0:
             passed.append("Net income positive.")
         else:
             failed.append("Net income not positive or unavailable.")
 
-        fundamental_pass = len(failed) == 0
+        status = "FUND_PASS" if len(failed) == 0 else "FUND_FAIL"
 
         return FundamentalResult(
             symbol=symbol,
-            fundamental_pass=fundamental_pass,
+            status=status,
             metrics=metrics,
             passed=passed,
             failed=failed
         )
 
     except Exception as e:
-        failed.append(f"Fundamental data error: {e}")
+        msg = str(e)
+
+        if "Too Many Requests" in msg or "Rate limited" in msg or "429" in msg:
+            failed.append("Fundamental data rate-limited. Manually verify fundamentals.")
+        else:
+            failed.append(f"Fundamental data error: {e}")
 
         return FundamentalResult(
             symbol=symbol,
-            fundamental_pass=False,
+            status="FUND_ERROR",
             metrics=metrics,
             passed=passed,
             failed=failed
@@ -703,7 +775,7 @@ def fetch_fundamentals(symbol: str) -> FundamentalResult:
 
 
 # ============================================================
-# STREAMLIT SIDEBAR
+# SIDEBAR
 # ============================================================
 
 st.sidebar.header("Universe")
@@ -711,12 +783,13 @@ st.sidebar.header("Universe")
 universe = st.sidebar.selectbox(
     "Choose universe",
     [
+        "Russell 1000",
         "S&P 500",
         "Nasdaq-100",
         "NASDAQ All",
         "NYSE All",
         "AMEX All",
-        "ALL US",
+        "ALL US Clean",
         "Paste tickers",
         "Upload tickers file"
     ],
@@ -735,7 +808,7 @@ max_tickers = st.sidebar.number_input(
     "Max tickers to scan",
     min_value=25,
     max_value=10000,
-    value=500,
+    value=1000,
     step=25
 )
 
@@ -753,6 +826,11 @@ parallel_batches = st.sidebar.slider(
     max_value=8,
     value=3,
     step=1
+)
+
+run_fundamentals = st.sidebar.checkbox(
+    "Run fundamentals on technical pass candidates",
+    value=True
 )
 
 st.sidebar.header("Position sizing")
@@ -775,7 +853,10 @@ st.sidebar.caption(
 
 symbols: List[str] = []
 
-if universe == "S&P 500":
+if universe == "Russell 1000":
+    symbols = load_russell1000()
+
+elif universe == "S&P 500":
     symbols = load_sp500()
 
 elif universe == "Nasdaq-100":
@@ -790,7 +871,7 @@ elif universe == "NYSE All":
 elif universe == "AMEX All":
     symbols = load_exchange_list("AMEX")
 
-elif universe == "ALL US":
+elif universe == "ALL US Clean":
     symbols = load_exchange_list("ALL")
 
 elif universe == "Paste tickers":
@@ -821,7 +902,6 @@ elif universe == "Upload tickers file":
         except Exception:
             symbols = parse_tickers(raw.decode("utf-8", errors="ignore"))
 
-
 symbols = clean_symbols(symbols)
 
 if len(symbols) > max_tickers:
@@ -837,23 +917,23 @@ confirmed = weekly_close_confirmed()
 c1, c2, c3 = st.columns([1, 1, 2])
 
 with c1:
-    run_scan = st.button("Run Exact FW Scan", use_container_width=True)
+    run_scan = st.button("Run Clean FW Scan", use_container_width=True)
 
 with c2:
-    show_only_ready = st.checkbox("Show only READY", value=False)
+    show_only_fund_pass = st.checkbox("Show only FUND_PASS", value=False)
 
 with c3:
     search = st.text_input("Search ticker").strip().upper()
 
-st.write(f"**Universe loaded:** {len(symbols)} symbols")
+st.write(f"**Clean universe loaded:** {len(symbols)} symbols")
 
 if confirmed:
-    st.success("Weekly close is confirmed. READY signals are official.")
+    st.success("Weekly close is confirmed. Technical passes can become official after fundamental review.")
 else:
-    st.warning("Weekly close is not confirmed. Passing setups will be marked WATCHLIST until Friday close.")
+    st.warning("Weekly close is not confirmed. Treat all passes as WATCHLIST until Friday close.")
 
 if not run_scan:
-    st.info("Click **Run Exact FW Scan** to begin.")
+    st.info("Click **Run Clean FW Scan** to begin.")
     st.stop()
 
 
@@ -861,7 +941,7 @@ if not run_scan:
 # RUN TECHNICAL SCAN
 # ============================================================
 
-st.subheader("1. Weekly Technical Scan")
+st.subheader("1. Weekly Technical FW Scan")
 
 progress = st.progress(0)
 status_text = st.empty()
@@ -876,7 +956,11 @@ def process_batch(batch: List[str]) -> List[TechnicalResult]:
 
     for sym in batch:
         df = weekly_data.get(sym)
-        results.append(evaluate_technical(sym, df))
+        result = evaluate_technical(sym, df)
+
+        # IMPORTANT: only return technical pass names.
+        if result.technical_pass:
+            results.append(result)
 
     return results
 
@@ -905,61 +989,64 @@ with ThreadPoolExecutor(max_workers=int(parallel_batches)) as executor:
 progress.empty()
 status_text.success("Technical scan complete.")
 
+technical_pass_symbols = list(technical_results.keys())
+
+st.write(f"Technical pass candidates: **{len(technical_pass_symbols)}**")
+
 
 # ============================================================
-# RUN FUNDAMENTAL SCAN ONLY ON TECHNICAL PASS NAMES
+# RUN FUNDAMENTALS ONLY ON TECHNICAL PASSES
 # ============================================================
-
-technical_pass_symbols = [
-    sym for sym, result in technical_results.items()
-    if result.technical_pass
-]
-
-st.subheader("2. Fundamental Quality Scan")
-st.write(f"Technical pass candidates sent to fundamentals: **{len(technical_pass_symbols)}**")
 
 fundamental_results: Dict[str, FundamentalResult] = {}
 
-fund_progress = st.progress(0)
-fund_status = st.empty()
+if run_fundamentals and technical_pass_symbols:
+    st.subheader("2. Fundamental Quality Scan")
 
-completed_fund = 0
+    fund_progress = st.progress(0)
+    fund_status = st.empty()
 
-with ThreadPoolExecutor(max_workers=8) as executor:
-    futures = {
-        executor.submit(fetch_fundamentals, sym): sym
-        for sym in technical_pass_symbols
-    }
+    completed_fund = 0
 
-    for future in as_completed(futures):
-        sym = futures[future]
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = {
+            executor.submit(fetch_fundamentals, sym): sym
+            for sym in technical_pass_symbols
+        }
 
-        try:
-            fundamental_results[sym] = future.result()
-        except Exception:
-            fundamental_results[sym] = FundamentalResult(
-                symbol=sym,
-                fundamental_pass=False,
-                metrics={},
-                passed=[],
-                failed=["Fundamental scan failed."]
+        for future in as_completed(futures):
+            sym = futures[future]
+
+            try:
+                fundamental_results[sym] = future.result()
+            except Exception as e:
+                fundamental_results[sym] = FundamentalResult(
+                    symbol=sym,
+                    status="FUND_ERROR",
+                    metrics={},
+                    passed=[],
+                    failed=[f"Fundamental scan failed: {e}"]
+                )
+
+            completed_fund += 1
+
+            fund_progress.progress(completed_fund / len(technical_pass_symbols))
+            fund_status.write(
+                f"Fundamental scan progress: {completed_fund}/{len(technical_pass_symbols)}"
             )
 
-        completed_fund += 1
+    fund_progress.empty()
+    fund_status.success("Fundamental scan complete.")
 
-        if len(technical_pass_symbols) > 0:
-            fund_progress.progress(completed_fund / len(technical_pass_symbols))
+elif not run_fundamentals:
+    st.info("Fundamental scan skipped. Showing technical pass candidates only.")
 
-        fund_status.write(
-            f"Fundamental scan progress: {completed_fund}/{len(technical_pass_symbols)}"
-        )
-
-fund_progress.empty()
-fund_status.success("Fundamental scan complete.")
+else:
+    st.info("No technical pass candidates. Fundamental scan skipped.")
 
 
 # ============================================================
-# BUILD FINAL RESULTS
+# BUILD FINAL RESULTS — ONLY TECHNICAL PASSES
 # ============================================================
 
 final_results: List[FinalResult] = []
@@ -972,18 +1059,20 @@ for sym, tech in technical_results.items():
     if fund is None:
         fund = FundamentalResult(
             symbol=sym,
-            fundamental_pass=False,
+            status="FUND_NOT_RUN",
             metrics={},
             passed=[],
-            failed=["Fundamentals not checked because technical scan failed."]
+            failed=["Fundamentals not run or not available."]
         )
 
-    if tech.technical_pass and fund.fundamental_pass:
-        status = "READY" if confirmed else "WATCHLIST"
-    elif tech.technical_pass and not fund.fundamental_pass:
+    if fund.status == "FUND_PASS":
+        status = "FUND_PASS" if confirmed else "WATCHLIST_FUND_PASS"
+    elif fund.status == "FUND_FAIL":
         status = "FUND_FAIL"
+    elif fund.status == "FUND_ERROR":
+        status = "FUND_ERROR"
     else:
-        status = "TECH_FAIL"
+        status = "TECH_PASS"
 
     shares = 0
     position_value = 0.0
@@ -1005,8 +1094,8 @@ for sym, tech in technical_results.items():
             entry=tech.entry,
             stop=tech.stop,
             stop_risk_pct=tech.stop_risk_pct,
-            position_value=position_value,
             shares=shares,
+            position_value=position_value,
             risk_dollars=risk_dollars,
             risk_on_equity_pct=risk_on_equity_pct,
             technical=tech,
@@ -1014,12 +1103,12 @@ for sym, tech in technical_results.items():
         )
     )
 
-
 order = {
-    "READY": 0,
-    "WATCHLIST": 1,
-    "FUND_FAIL": 2,
-    "TECH_FAIL": 3,
+    "FUND_PASS": 0,
+    "WATCHLIST_FUND_PASS": 1,
+    "TECH_PASS": 2,
+    "FUND_ERROR": 3,
+    "FUND_FAIL": 4,
 }
 
 final_results.sort(
@@ -1030,31 +1119,26 @@ final_results.sort(
 )
 
 if search:
-    final_results = [
-        r for r in final_results
-        if search in r.symbol
-    ]
+    final_results = [r for r in final_results if search in r.symbol]
 
-if show_only_ready:
-    final_results = [
-        r for r in final_results
-        if r.status == "READY"
-    ]
+if show_only_fund_pass:
+    final_results = [r for r in final_results if r.status in ("FUND_PASS", "WATCHLIST_FUND_PASS")]
 
 
 # ============================================================
-# OUTPUT SUMMARY
+# SUMMARY
 # ============================================================
 
-ready_symbols = [r.symbol for r in final_results if r.status == "READY"]
-watchlist_symbols = [r.symbol for r in final_results if r.status == "WATCHLIST"]
+fund_pass_count = sum(1 for r in final_results if r.status in ("FUND_PASS", "WATCHLIST_FUND_PASS"))
+fund_fail_count = sum(1 for r in final_results if r.status == "FUND_FAIL")
+fund_error_count = sum(1 for r in final_results if r.status == "FUND_ERROR")
 
 s1, s2, s3, s4 = st.columns(4)
 
-s1.metric("Scanned", len(final_results))
-s2.metric("READY", len(ready_symbols))
-s3.metric("WATCHLIST", len(watchlist_symbols))
-s4.metric("Technical Pass", len(technical_pass_symbols))
+s1.metric("Technical Pass", len(technical_pass_symbols))
+s2.metric("Fund Pass", fund_pass_count)
+s3.metric("Fund Fail", fund_fail_count)
+s4.metric("Fund Error", fund_error_count)
 
 
 # ============================================================
@@ -1063,20 +1147,23 @@ s4.metric("Technical Pass", len(technical_pass_symbols))
 
 st.subheader("TradingView Export")
 
-export_symbols = ready_symbols if confirmed else watchlist_symbols
+export_symbols = [
+    r.symbol for r in final_results
+    if r.status in ("FUND_PASS", "WATCHLIST_FUND_PASS", "TECH_PASS", "FUND_ERROR")
+]
 
 export_text = "\n".join([f"{tv_prefix}:{sym}" for sym in export_symbols])
 
 st.text_area(
-    "Copy this into TradingView",
+    "Copy passing candidates into TradingView",
     value=export_text,
     height=120
 )
 
 st.download_button(
-    "Download FW_watchlist.txt",
+    "Download FW_candidates.txt",
     data=export_text.encode("utf-8"),
-    file_name="FW_watchlist.txt",
+    file_name="FW_candidates.txt",
     mime="text/plain",
     use_container_width=True
 )
@@ -1086,7 +1173,7 @@ st.download_button(
 # RESULTS TABLE
 # ============================================================
 
-st.subheader("Exact FW Scan Results")
+st.subheader("Clean FW Candidates Only")
 
 table_rows = []
 
@@ -1112,9 +1199,9 @@ for r in final_results:
         "Upper Wick %": None if tm.get("upper_wick_pct") is None else round(tm.get("upper_wick_pct"), 2),
         "Box High": None if tm.get("box_high") is None else round(tm.get("box_high"), 2),
         "Box Low": None if tm.get("box_low") is None else round(tm.get("box_low"), 2),
-        "ROC": None if fm.get("roc") is None else round(fm.get("roc") * 100, 2),
-        "ROE": None if fm.get("roe") is None else round(fm.get("roe") * 100, 2),
-        "Operating Margin": None if fm.get("operating_margin") is None else round(fm.get("operating_margin") * 100, 2),
+        "ROC %": None if fm.get("roc") is None else round(fm.get("roc") * 100, 2),
+        "ROE %": None if fm.get("roe") is None else round(fm.get("roe") * 100, 2),
+        "Operating Margin %": None if fm.get("operating_margin") is None else round(fm.get("operating_margin") * 100, 2),
     })
 
 results_df = pd.DataFrame(table_rows)
@@ -1130,7 +1217,7 @@ st.dataframe(
 # EXPLAINABILITY
 # ============================================================
 
-st.subheader("Why did it pass or fail?")
+st.subheader("Why did it pass or fail fundamentals?")
 
 if len(final_results) > 0:
     selected_symbol = st.selectbox(
@@ -1155,25 +1242,15 @@ if len(final_results) > 0:
             st.write(f"- Risk on equity: {selected.risk_on_equity_pct:.2f}%")
 
             st.write("**Technical Metrics**")
-            st.write(selected.technical.metrics)
+            st.json(selected.technical.metrics)
 
             st.write("**Fundamental Metrics**")
-            st.write(selected.fundamental.metrics)
+            st.json(selected.fundamental.metrics)
 
         with right:
             st.markdown("### Technical Passed")
-            if selected.technical.passed:
-                for item in selected.technical.passed:
-                    st.success(item)
-            else:
-                st.info("None")
-
-            st.markdown("### Technical Failed")
-            if selected.technical.failed:
-                for item in selected.technical.failed:
-                    st.error(item)
-            else:
-                st.success("None")
+            for item in selected.technical.passed:
+                st.success(item)
 
             st.markdown("### Fundamental Passed")
             if selected.fundamental.passed:
@@ -1182,7 +1259,7 @@ if len(final_results) > 0:
             else:
                 st.info("None")
 
-            st.markdown("### Fundamental Failed")
+            st.markdown("### Fundamental Failed / Error")
             if selected.fundamental.failed:
                 for item in selected.fundamental.failed:
                     st.error(item)
@@ -1196,9 +1273,7 @@ if len(final_results) > 0:
 
 st.subheader("Journal Export")
 
-journal_df = results_df[
-    results_df["Status"].isin(["READY", "WATCHLIST"])
-].copy()
+journal_df = results_df.copy()
 
 journal_df.insert(
     0,
@@ -1209,9 +1284,9 @@ journal_df.insert(
 csv_bytes = journal_df.to_csv(index=False).encode("utf-8")
 
 st.download_button(
-    "Download FW_journal.csv",
+    "Download FW_candidates_journal.csv",
     data=csv_bytes,
-    file_name="FW_journal.csv",
+    file_name="FW_candidates_journal.csv",
     mime="text/csv",
     use_container_width=True
 )
@@ -1223,10 +1298,10 @@ st.download_button(
 
 with st.expander("How this scanner matches Financial Wisdom"):
     st.markdown(
-        f"""
-        This scanner uses fixed FW criteria only:
+        """
+        This clean scanner only displays stocks that pass the exact Financial Wisdom technical gate.
 
-        **Technical**
+        **Technical requirements**
         - Weekly chart
         - Price above 20-week MA
         - Weekly MACD line above signal
@@ -1239,18 +1314,16 @@ with st.expander("How this scanner matches Financial Wisdom"):
         - Upper wick 50% or less
         - Stop risk under 20%
 
-        **Stop**
-        - Consolidation box is split into thirds.
-        - Stop is placed at the lower boundary of the middle third.
-
-        **Fundamentals**
+        **Fundamental requirements**
         - ROC above 10%
         - ROE above 10%
         - Operating margin above 10%
         - Revenue positive
         - Net income positive
 
-        **Position sizing**
-        - Uses FW example position size of 16% of equity.
+        **Important**
+        - If fundamentals return FUND_ERROR, manually verify them.
+        - Yahoo/yfinance may rate-limit fundamentals.
+        - Technical pass candidates are still valuable even if fundamentals fail to load.
         """
     )
