@@ -20,14 +20,14 @@ except Exception:
 # ============================================================
 
 st.set_page_config(
-    page_title="Financial Wisdom Clean Scanner",
+    page_title="Financial Wisdom Pipeline Scanner",
     page_icon="📈",
     layout="wide"
 )
 
-st.title("📈 Financial Wisdom Clean Breakout Scanner")
+st.title("📈 Financial Wisdom Pipeline Scanner")
 st.caption(
-    "Broad clean-stock scanner. Shows only FW technical pass candidates, then fundamental pass/fail if available."
+    "Broad clean-stock scanner: FW Pre-Breakout Watchlist → Exact Breakout → Fundamental QC → Graduation Tracking."
 )
 
 
@@ -52,6 +52,10 @@ FW_MIN_OPERATING_MARGIN = 0.10
 
 FW_POSITION_SIZE_PCT = 0.16
 
+# Watchlist / pre-breakout rules
+PRE_NEAR_RESISTANCE_PCT = 5.0
+PRE_MIN_CLOSE_IN_BOX_PCT = 50.0
+
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -68,7 +72,7 @@ HEADERS = {
 @dataclass
 class TechnicalResult:
     symbol: str
-    technical_pass: bool
+    stage: str  # BREAKOUT / PRE_BREAKOUT / NONE
     entry: Optional[float]
     stop: Optional[float]
     stop_risk_pct: Optional[float]
@@ -89,7 +93,10 @@ class FundamentalResult:
 @dataclass
 class FinalResult:
     symbol: str
+    stage: str
     status: str
+    graduated: bool
+    previous_stage: str
     entry: Optional[float]
     stop: Optional[float]
     stop_risk_pct: Optional[float]
@@ -132,34 +139,20 @@ def weekly_close_confirmed() -> bool:
 # ============================================================
 
 BAD_SECURITY_KEYWORDS = [
-    "ETF",
-    "ETN",
-    "FUND",
-    "TRUST",
-    "PREFERRED",
-    "PFD",
-    "PRF",
-    "WARRANT",
-    "WARRANTS",
-    "RIGHT",
-    "RIGHTS",
-    "UNIT",
-    "UNITS",
-    "NOTE",
-    "NOTES",
-    "BOND",
-    "DEBENTURE",
-    "ADR EACH",
-    "ADS EACH",
-    "DEPOSITARY",
-    "SPAC",
+    "ETF", "ETN", "FUND", "TRUST",
+    "PREFERRED", "PFD", "PRF",
+    "WARRANT", "WARRANTS",
+    "RIGHT", "RIGHTS",
+    "UNIT", "UNITS",
+    "NOTE", "NOTES", "BOND", "DEBENTURE",
+    "DEPOSITARY", "BABY BOND",
     "ACQUISITION CORP UNIT",
     "ACQUISITION CORP RIGHT",
     "ACQUISITION CORP WARRANT",
 ]
 
 BAD_SYMBOL_SUFFIXES = [
-    "W", "WS", "WT", "WTA", "WTB",
+    "WS", "WT", "WTA", "WTB",
     "U", "R",
     "P", "PA", "PB", "PC", "PD", "PE", "PF", "PG", "PH", "PI", "PJ", "PK",
     "PL", "PM", "PN", "PO", "PP", "PQ", "PR", "PS", "PT", "PU", "PV", "PW", "PX", "PY", "PZ"
@@ -185,15 +178,12 @@ def looks_like_common_stock(symbol: str, security_name: str = "") -> bool:
     if not any(ch.isalpha() for ch in sym):
         return False
 
-    # Symbol suffix filters: catches many preferreds/warrants/units.
-    # Examples: NHPBP, ABC.WS, XYZU, XYZR, etc.
-    for suffix in BAD_SYMBOL_SUFFIXES:
-        if sym.endswith(suffix) and len(sym) >= 5:
-            return False
-
-    # Name keyword filters.
     for bad in BAD_SECURITY_KEYWORDS:
         if bad in name:
+            return False
+
+    for suffix in BAD_SYMBOL_SUFFIXES:
+        if sym.endswith(suffix) and len(sym) >= 5:
             return False
 
     return True
@@ -376,10 +366,11 @@ def load_exchange_list(exchange: str) -> List[str]:
                     symbols.append(sym)
 
     elif exchange == "ALL":
-        nasdaq_symbols = load_exchange_list("NASDAQ")
-        nyse_symbols = load_exchange_list("NYSE")
-        amex_symbols = load_exchange_list("AMEX")
-        symbols = nasdaq_symbols + nyse_symbols + amex_symbols
+        symbols = (
+            load_exchange_list("NASDAQ")
+            + load_exchange_list("NYSE")
+            + load_exchange_list("AMEX")
+        )
 
     return clean_symbols(symbols)
 
@@ -469,7 +460,7 @@ def download_weekly_batch(symbols: List[str]) -> Dict[str, pd.DataFrame]:
 
 
 # ============================================================
-# TECHNICAL EVALUATION
+# TECHNICAL EVALUATION: EXACT + PRE-BREAKOUT
 # ============================================================
 
 def evaluate_technical(symbol: str, df: Optional[pd.DataFrame]) -> TechnicalResult:
@@ -479,7 +470,7 @@ def evaluate_technical(symbol: str, df: Optional[pd.DataFrame]) -> TechnicalResu
 
     if df is None or df.empty or len(df) < 60:
         failed.append("Not enough weekly data.")
-        return TechnicalResult(symbol, False, None, None, None, metrics, passed, failed)
+        return TechnicalResult(symbol, "NONE", None, None, None, metrics, passed, failed)
 
     df = df.copy().dropna()
 
@@ -528,6 +519,16 @@ def evaluate_technical(symbol: str, df: Optional[pd.DataFrame]) -> TechnicalResu
     else:
         stop_risk_pct = None
 
+    if box_range > 0:
+        close_position_in_box_pct = ((current_close - box_low) / box_range) * 100.0
+    else:
+        close_position_in_box_pct = None
+
+    if box_high > 0:
+        distance_to_resistance_pct = ((box_high - current_close) / box_high) * 100.0
+    else:
+        distance_to_resistance_pct = None
+
     metrics.update({
         "close": current_close,
         "ma20": float(ma20) if not pd.isna(ma20) else None,
@@ -542,63 +543,121 @@ def evaluate_technical(symbol: str, df: Optional[pd.DataFrame]) -> TechnicalResu
         "upper_wick_pct": upper_wick_pct,
         "volume_spike_pct": volume_spike_pct,
         "stop_risk_pct": stop_risk_pct,
+        "distance_to_resistance_pct": distance_to_resistance_pct,
+        "close_position_in_box_pct": close_position_in_box_pct,
     })
 
-    if ma20 is not None and not pd.isna(ma20) and current_close > ma20:
+    trend_ok = ma20 is not None and not pd.isna(ma20) and current_close > ma20
+    macd_ok = not pd.isna(current_macd) and not pd.isna(current_signal) and current_macd > current_signal
+    natr_ok = not pd.isna(current_natr) and current_natr < FW_NATR_MAX
+    box_ok = len(prior_box) >= FW_MIN_CONSOLIDATION_WEEKS and box_range > 0
+    close_above_resistance = current_close > box_high
+    ten_week_high_ok = current_close > prior_10w_high_close
+    volume_ok = volume_spike_pct is not None and volume_spike_pct >= FW_MIN_VOLUME_SPIKE_PCT
+    breakout_size_ok = FW_MIN_BREAKOUT_PCT < breakout_pct < FW_MAX_BREAKOUT_PCT
+    wick_ok = upper_wick_pct <= FW_MAX_UPPER_WICK_PCT
+    stop_ok = stop_risk_pct is not None and stop_risk_pct < FW_MAX_STOP_RISK_PCT
+
+    near_resistance_ok = (
+        distance_to_resistance_pct is not None
+        and 0 <= distance_to_resistance_pct <= PRE_NEAR_RESISTANCE_PCT
+    )
+
+    high_in_box_ok = (
+        close_position_in_box_pct is not None
+        and close_position_in_box_pct >= PRE_MIN_CLOSE_IN_BOX_PCT
+    )
+
+    # Exact FW breakout
+    exact_pass = all([
+        trend_ok,
+        macd_ok,
+        natr_ok,
+        box_ok,
+        close_above_resistance,
+        ten_week_high_ok,
+        volume_ok,
+        breakout_size_ok,
+        wick_ok,
+        stop_ok,
+    ])
+
+    # Pre-breakout watchlist:
+    # This is NOT a buy signal. It means the stock is coiling near resistance.
+    pre_breakout_pass = all([
+        trend_ok,
+        macd_ok,
+        natr_ok,
+        box_ok,
+        not close_above_resistance,
+        near_resistance_ok,
+        high_in_box_ok,
+        stop_ok,
+    ])
+
+    if exact_pass:
+        stage = "BREAKOUT"
+    elif pre_breakout_pass:
+        stage = "PRE_BREAKOUT"
+    else:
+        stage = "NONE"
+
+    if trend_ok:
         passed.append("Price above 20-week MA.")
     else:
         failed.append("Price not above 20-week MA.")
 
-    if not pd.isna(current_macd) and not pd.isna(current_signal) and current_macd > current_signal:
+    if macd_ok:
         passed.append("Weekly MACD line above signal line.")
     else:
         failed.append("Weekly MACD not bullish.")
 
-    if not pd.isna(current_natr) and current_natr < FW_NATR_MAX:
+    if natr_ok:
         passed.append("Weekly NATR under 8.")
     else:
         failed.append("Weekly NATR not under 8.")
 
-    if len(prior_box) >= FW_MIN_CONSOLIDATION_WEEKS and box_range > 0:
+    if box_ok:
         passed.append("Minimum 6-week consolidation box exists.")
     else:
         failed.append("No valid 6-week consolidation box.")
 
-    if current_close > box_high:
+    if close_above_resistance:
         passed.append("Weekly close above consolidation resistance.")
     else:
         failed.append("Weekly close not above consolidation resistance.")
 
-    if current_close > prior_10w_high_close:
+    if ten_week_high_ok:
         passed.append("Breakout candle is a 10-week closing high.")
     else:
         failed.append("Breakout candle is not a 10-week closing high.")
 
-    if volume_spike_pct is not None and volume_spike_pct >= FW_MIN_VOLUME_SPIKE_PCT:
+    if volume_ok:
         passed.append("Volume spike at least 30% above prior week.")
     else:
         failed.append("Volume spike less than 30% above prior week.")
 
-    if FW_MIN_BREAKOUT_PCT < breakout_pct < FW_MAX_BREAKOUT_PCT:
+    if breakout_size_ok:
         passed.append("Breakout size between 5% and 20%.")
     else:
         failed.append("Breakout size not between 5% and 20%.")
 
-    if upper_wick_pct <= FW_MAX_UPPER_WICK_PCT:
+    if wick_ok:
         passed.append("Upper wick is 50% or less.")
     else:
         failed.append("Upper wick greater than 50%.")
 
-    if stop_risk_pct is not None and stop_risk_pct < FW_MAX_STOP_RISK_PCT:
+    if stop_ok:
         passed.append("Stop risk under 20%.")
     else:
         failed.append("Stop risk not under 20%.")
 
-    technical_pass = len(failed) == 0
+    if pre_breakout_pass:
+        passed.append("PRE_BREAKOUT: price is within 5% below resistance and high in the box.")
 
     return TechnicalResult(
         symbol=symbol,
-        technical_pass=technical_pass,
+        stage=stage,
         entry=current_close,
         stop=stop,
         stop_risk_pct=stop_risk_pct,
@@ -775,6 +834,43 @@ def fetch_fundamentals(symbol: str) -> FundamentalResult:
 
 
 # ============================================================
+# PREVIOUS SCAN LOADER FOR GRADUATION
+# ============================================================
+
+def previous_stage_map_from_df(df: pd.DataFrame) -> Dict[str, str]:
+    out = {}
+
+    if df is None or df.empty:
+        return out
+
+    symbol_col = None
+    stage_col = None
+
+    for c in df.columns:
+        cl = str(c).lower()
+        if cl == "symbol":
+            symbol_col = c
+        if cl in ("stage", "status"):
+            stage_col = c
+
+    if symbol_col is None or stage_col is None:
+        return out
+
+    for _, row in df.iterrows():
+        sym = str(row[symbol_col]).strip().upper()
+        stage = str(row[stage_col]).strip().upper()
+
+        if "PRE" in stage:
+            out[sym] = "PRE_BREAKOUT"
+        elif "BREAKOUT" in stage or "FUND_PASS" in stage or "TECH_PASS" in stage:
+            out[sym] = "BREAKOUT"
+        else:
+            out[sym] = stage
+
+    return out
+
+
+# ============================================================
 # SIDEBAR
 # ============================================================
 
@@ -798,7 +894,7 @@ universe = st.sidebar.selectbox(
 
 tv_prefix = st.sidebar.selectbox(
     "TradingView export prefix",
-    ["NASDAQ", "NYSE", "AMEX", "NYSEARCA", "CBOE"],
+    ["NYSE", "NASDAQ", "AMEX", "NYSEARCA", "CBOE"],
     index=0
 )
 
@@ -829,8 +925,19 @@ parallel_batches = st.sidebar.slider(
 )
 
 run_fundamentals = st.sidebar.checkbox(
-    "Run fundamentals on technical pass candidates",
+    "Run fundamentals on BREAKOUT candidates",
     value=True
+)
+
+st.sidebar.header("Graduation Tracking")
+
+previous_scan_upload = st.sidebar.file_uploader(
+    "Upload previous FW candidates CSV",
+    type=["csv"]
+)
+
+st.sidebar.caption(
+    "Graduation = stock was PRE_BREAKOUT in previous scan and is BREAKOUT now."
 )
 
 st.sidebar.header("Position sizing")
@@ -845,6 +952,23 @@ account_equity = st.sidebar.number_input(
 st.sidebar.caption(
     f"FW position size is fixed at 16% of equity: ${account_equity * FW_POSITION_SIZE_PCT:,.2f}"
 )
+
+
+# ============================================================
+# LOAD PREVIOUS SCAN
+# ============================================================
+
+previous_stage_map: Dict[str, str] = {}
+
+if previous_scan_upload is not None:
+    try:
+        previous_df = pd.read_csv(previous_scan_upload)
+        previous_stage_map = previous_stage_map_from_df(previous_df)
+    except Exception:
+        st.sidebar.error("Could not read previous scan CSV.")
+
+elif "last_scan_df" in st.session_state:
+    previous_stage_map = previous_stage_map_from_df(st.session_state["last_scan_df"])
 
 
 # ============================================================
@@ -917,10 +1041,10 @@ confirmed = weekly_close_confirmed()
 c1, c2, c3 = st.columns([1, 1, 2])
 
 with c1:
-    run_scan = st.button("Run Clean FW Scan", use_container_width=True)
+    run_scan = st.button("Run FW Pipeline Scan", use_container_width=True)
 
 with c2:
-    show_only_fund_pass = st.checkbox("Show only FUND_PASS", value=False)
+    show_only_breakout = st.checkbox("Show only BREAKOUT", value=False)
 
 with c3:
     search = st.text_input("Search ticker").strip().upper()
@@ -928,20 +1052,20 @@ with c3:
 st.write(f"**Clean universe loaded:** {len(symbols)} symbols")
 
 if confirmed:
-    st.success("Weekly close is confirmed. Technical passes can become official after fundamental review.")
+    st.success("Weekly close is confirmed. BREAKOUT candidates can be official after fundamental review.")
 else:
-    st.warning("Weekly close is not confirmed. Treat all passes as WATCHLIST until Friday close.")
+    st.warning("Weekly close is not confirmed. Treat BREAKOUT candidates as provisional until Friday close.")
 
 if not run_scan:
-    st.info("Click **Run Clean FW Scan** to begin.")
+    st.info("Click **Run FW Pipeline Scan** to begin.")
     st.stop()
 
 
 # ============================================================
-# RUN TECHNICAL SCAN
+# RUN TECHNICAL PIPELINE SCAN
 # ============================================================
 
-st.subheader("1. Weekly Technical FW Scan")
+st.subheader("1. Weekly FW Pipeline Scan")
 
 progress = st.progress(0)
 status_text = st.empty()
@@ -949,6 +1073,7 @@ status_text = st.empty()
 technical_results: Dict[str, TechnicalResult] = {}
 
 symbol_batches = chunked(symbols, int(batch_size))
+
 
 def process_batch(batch: List[str]) -> List[TechnicalResult]:
     weekly_data = download_weekly_batch(batch)
@@ -958,8 +1083,8 @@ def process_batch(batch: List[str]) -> List[TechnicalResult]:
         df = weekly_data.get(sym)
         result = evaluate_technical(sym, df)
 
-        # IMPORTANT: only return technical pass names.
-        if result.technical_pass:
+        # Only return pipeline candidates.
+        if result.stage in ("PRE_BREAKOUT", "BREAKOUT"):
             results.append(result)
 
     return results
@@ -984,23 +1109,38 @@ with ThreadPoolExecutor(max_workers=int(parallel_batches)) as executor:
 
         completed += 1
         progress.progress(completed / max(1, len(symbol_batches)))
-        status_text.write(f"Technical scan progress: {completed}/{len(symbol_batches)} batches")
+        status_text.write(f"Pipeline scan progress: {completed}/{len(symbol_batches)} batches")
 
 progress.empty()
-status_text.success("Technical scan complete.")
+status_text.success("Technical pipeline scan complete.")
 
-technical_pass_symbols = list(technical_results.keys())
+pre_breakout_symbols = [
+    sym for sym, result in technical_results.items()
+    if result.stage == "PRE_BREAKOUT"
+]
 
-st.write(f"Technical pass candidates: **{len(technical_pass_symbols)}**")
+breakout_symbols = [
+    sym for sym, result in technical_results.items()
+    if result.stage == "BREAKOUT"
+]
+
+graduated_symbols = [
+    sym for sym in breakout_symbols
+    if previous_stage_map.get(sym) == "PRE_BREAKOUT"
+]
+
+st.write(f"PRE_BREAKOUT candidates: **{len(pre_breakout_symbols)}**")
+st.write(f"BREAKOUT candidates: **{len(breakout_symbols)}**")
+st.write(f"GRADUATED candidates: **{len(graduated_symbols)}**")
 
 
 # ============================================================
-# RUN FUNDAMENTALS ONLY ON TECHNICAL PASSES
+# RUN FUNDAMENTALS ONLY ON BREAKOUTS
 # ============================================================
 
 fundamental_results: Dict[str, FundamentalResult] = {}
 
-if run_fundamentals and technical_pass_symbols:
+if run_fundamentals and breakout_symbols:
     st.subheader("2. Fundamental Quality Scan")
 
     fund_progress = st.progress(0)
@@ -1011,7 +1151,7 @@ if run_fundamentals and technical_pass_symbols:
     with ThreadPoolExecutor(max_workers=4) as executor:
         futures = {
             executor.submit(fetch_fundamentals, sym): sym
-            for sym in technical_pass_symbols
+            for sym in breakout_symbols
         }
 
         for future in as_completed(futures):
@@ -1029,24 +1169,23 @@ if run_fundamentals and technical_pass_symbols:
                 )
 
             completed_fund += 1
-
-            fund_progress.progress(completed_fund / len(technical_pass_symbols))
+            fund_progress.progress(completed_fund / len(breakout_symbols))
             fund_status.write(
-                f"Fundamental scan progress: {completed_fund}/{len(technical_pass_symbols)}"
+                f"Fundamental scan progress: {completed_fund}/{len(breakout_symbols)}"
             )
 
     fund_progress.empty()
     fund_status.success("Fundamental scan complete.")
 
 elif not run_fundamentals:
-    st.info("Fundamental scan skipped. Showing technical pass candidates only.")
+    st.info("Fundamental scan skipped. Showing technical pipeline candidates only.")
 
 else:
-    st.info("No technical pass candidates. Fundamental scan skipped.")
+    st.info("No BREAKOUT candidates. Fundamental scan skipped.")
 
 
 # ============================================================
-# BUILD FINAL RESULTS — ONLY TECHNICAL PASSES
+# BUILD FINAL RESULTS
 # ============================================================
 
 final_results: List[FinalResult] = []
@@ -1062,17 +1201,29 @@ for sym, tech in technical_results.items():
             status="FUND_NOT_RUN",
             metrics={},
             passed=[],
-            failed=["Fundamentals not run or not available."]
+            failed=["Fundamentals not run. Only BREAKOUT candidates are checked."]
         )
 
-    if fund.status == "FUND_PASS":
-        status = "FUND_PASS" if confirmed else "WATCHLIST_FUND_PASS"
-    elif fund.status == "FUND_FAIL":
-        status = "FUND_FAIL"
-    elif fund.status == "FUND_ERROR":
-        status = "FUND_ERROR"
+    previous_stage = previous_stage_map.get(sym, "NEW")
+    graduated = previous_stage == "PRE_BREAKOUT" and tech.stage == "BREAKOUT"
+
+    if tech.stage == "PRE_BREAKOUT":
+        status = "PRE_BREAKOUT"
+
+    elif tech.stage == "BREAKOUT":
+        if graduated:
+            status = "GRADUATED_BREAKOUT"
+        elif fund.status == "FUND_PASS":
+            status = "BREAKOUT_FUND_PASS"
+        elif fund.status == "FUND_FAIL":
+            status = "BREAKOUT_FUND_FAIL"
+        elif fund.status == "FUND_ERROR":
+            status = "BREAKOUT_FUND_ERROR"
+        else:
+            status = "BREAKOUT"
+
     else:
-        status = "TECH_PASS"
+        status = "NONE"
 
     shares = 0
     position_value = 0.0
@@ -1090,7 +1241,10 @@ for sym, tech in technical_results.items():
     final_results.append(
         FinalResult(
             symbol=sym,
+            stage=tech.stage,
             status=status,
+            graduated=graduated,
+            previous_stage=previous_stage,
             entry=tech.entry,
             stop=tech.stop,
             stop_risk_pct=tech.stop_risk_pct,
@@ -1103,17 +1257,19 @@ for sym, tech in technical_results.items():
         )
     )
 
+
 order = {
-    "FUND_PASS": 0,
-    "WATCHLIST_FUND_PASS": 1,
-    "TECH_PASS": 2,
-    "FUND_ERROR": 3,
-    "FUND_FAIL": 4,
+    "GRADUATED_BREAKOUT": 0,
+    "BREAKOUT_FUND_PASS": 1,
+    "BREAKOUT": 2,
+    "BREAKOUT_FUND_ERROR": 3,
+    "BREAKOUT_FUND_FAIL": 4,
+    "PRE_BREAKOUT": 5,
 }
 
 final_results.sort(
     key=lambda r: (
-        order.get(r.status, 9),
+        order.get(r.status, 99),
         r.symbol
     )
 )
@@ -1121,24 +1277,25 @@ final_results.sort(
 if search:
     final_results = [r for r in final_results if search in r.symbol]
 
-if show_only_fund_pass:
-    final_results = [r for r in final_results if r.status in ("FUND_PASS", "WATCHLIST_FUND_PASS")]
+if show_only_breakout:
+    final_results = [r for r in final_results if r.stage == "BREAKOUT"]
 
 
 # ============================================================
 # SUMMARY
 # ============================================================
 
-fund_pass_count = sum(1 for r in final_results if r.status in ("FUND_PASS", "WATCHLIST_FUND_PASS"))
-fund_fail_count = sum(1 for r in final_results if r.status == "FUND_FAIL")
-fund_error_count = sum(1 for r in final_results if r.status == "FUND_ERROR")
+pre_count = sum(1 for r in final_results if r.stage == "PRE_BREAKOUT")
+breakout_count = sum(1 for r in final_results if r.stage == "BREAKOUT")
+graduated_count = sum(1 for r in final_results if r.graduated)
+fund_pass_count = sum(1 for r in final_results if r.status == "BREAKOUT_FUND_PASS")
 
 s1, s2, s3, s4 = st.columns(4)
 
-s1.metric("Technical Pass", len(technical_pass_symbols))
-s2.metric("Fund Pass", fund_pass_count)
-s3.metric("Fund Fail", fund_fail_count)
-s4.metric("Fund Error", fund_error_count)
+s1.metric("PRE_BREAKOUT", pre_count)
+s2.metric("BREAKOUT", breakout_count)
+s3.metric("GRADUATED", graduated_count)
+s4.metric("FUND_PASS", fund_pass_count)
 
 
 # ============================================================
@@ -1147,23 +1304,36 @@ s4.metric("Fund Error", fund_error_count)
 
 st.subheader("TradingView Export")
 
-export_symbols = [
-    r.symbol for r in final_results
-    if r.status in ("FUND_PASS", "WATCHLIST_FUND_PASS", "TECH_PASS", "FUND_ERROR")
-]
+export_mode = st.radio(
+    "Export list",
+    ["All pipeline candidates", "Breakouts only", "Graduated only", "Pre-breakouts only"],
+    horizontal=True
+)
+
+if export_mode == "Breakouts only":
+    export_symbols = [r.symbol for r in final_results if r.stage == "BREAKOUT"]
+
+elif export_mode == "Graduated only":
+    export_symbols = [r.symbol for r in final_results if r.graduated]
+
+elif export_mode == "Pre-breakouts only":
+    export_symbols = [r.symbol for r in final_results if r.stage == "PRE_BREAKOUT"]
+
+else:
+    export_symbols = [r.symbol for r in final_results]
 
 export_text = "\n".join([f"{tv_prefix}:{sym}" for sym in export_symbols])
 
 st.text_area(
-    "Copy passing candidates into TradingView",
+    "Copy candidates into TradingView",
     value=export_text,
     height=120
 )
 
 st.download_button(
-    "Download FW_candidates.txt",
+    "Download FW_pipeline_candidates.txt",
     data=export_text.encode("utf-8"),
-    file_name="FW_candidates.txt",
+    file_name="FW_pipeline_candidates.txt",
     mime="text/plain",
     use_container_width=True
 )
@@ -1173,7 +1343,7 @@ st.download_button(
 # RESULTS TABLE
 # ============================================================
 
-st.subheader("Clean FW Candidates Only")
+st.subheader("FW Pipeline Candidates")
 
 table_rows = []
 
@@ -1183,7 +1353,10 @@ for r in final_results:
 
     table_rows.append({
         "Symbol": r.symbol,
+        "Stage": r.stage,
         "Status": r.status,
+        "Graduated": "YES" if r.graduated else "",
+        "Previous Stage": r.previous_stage,
         "Entry": None if r.entry is None else round(r.entry, 2),
         "Stop": None if r.stop is None else round(r.stop, 2),
         "Stop Risk %": None if r.stop_risk_pct is None else round(r.stop_risk_pct, 2),
@@ -1194,6 +1367,8 @@ for r in final_results:
         "Close": None if tm.get("close") is None else round(tm.get("close"), 2),
         "20W MA": None if tm.get("ma20") is None else round(tm.get("ma20"), 2),
         "NATR": None if tm.get("natr") is None else round(tm.get("natr"), 2),
+        "Distance to Resistance %": None if tm.get("distance_to_resistance_pct") is None else round(tm.get("distance_to_resistance_pct"), 2),
+        "Box Position %": None if tm.get("close_position_in_box_pct") is None else round(tm.get("close_position_in_box_pct"), 2),
         "Volume Spike %": None if tm.get("volume_spike_pct") is None else round(tm.get("volume_spike_pct"), 2),
         "Breakout %": None if tm.get("breakout_pct") is None else round(tm.get("breakout_pct"), 2),
         "Upper Wick %": None if tm.get("upper_wick_pct") is None else round(tm.get("upper_wick_pct"), 2),
@@ -1206,6 +1381,8 @@ for r in final_results:
 
 results_df = pd.DataFrame(table_rows)
 
+st.session_state["last_scan_df"] = results_df.copy()
+
 st.dataframe(
     results_df,
     use_container_width=True,
@@ -1217,7 +1394,7 @@ st.dataframe(
 # EXPLAINABILITY
 # ============================================================
 
-st.subheader("Why did it pass or fail fundamentals?")
+st.subheader("Why is this candidate here?")
 
 if len(final_results) > 0:
     selected_symbol = st.selectbox(
@@ -1234,6 +1411,14 @@ if len(final_results) > 0:
         with left:
             st.markdown(f"### {selected.symbol} — {selected.status}")
 
+            if selected.graduated:
+                st.success("GRADUATED: This stock was PRE_BREAKOUT before and is BREAKOUT now.")
+
+            st.write("**Pipeline**")
+            st.write(f"- Previous Stage: {selected.previous_stage}")
+            st.write(f"- Current Stage: {selected.stage}")
+            st.write(f"- Status: {selected.status}")
+
             st.write("**Execution**")
             st.write(f"- Entry: {selected.entry if selected.entry is not None else '—'}")
             st.write(f"- Stop: {selected.stop if selected.stop is not None else '—'}")
@@ -1249,8 +1434,18 @@ if len(final_results) > 0:
 
         with right:
             st.markdown("### Technical Passed")
-            for item in selected.technical.passed:
-                st.success(item)
+            if selected.technical.passed:
+                for item in selected.technical.passed:
+                    st.success(item)
+            else:
+                st.info("None")
+
+            st.markdown("### Technical Failed / Not Yet Triggered")
+            if selected.technical.failed:
+                for item in selected.technical.failed:
+                    st.warning(item)
+            else:
+                st.success("None")
 
             st.markdown("### Fundamental Passed")
             if selected.fundamental.passed:
@@ -1271,7 +1466,7 @@ if len(final_results) > 0:
 # JOURNAL EXPORT
 # ============================================================
 
-st.subheader("Journal Export")
+st.subheader("Journal / Previous Scan Export")
 
 journal_df = results_df.copy()
 
@@ -1284,11 +1479,15 @@ journal_df.insert(
 csv_bytes = journal_df.to_csv(index=False).encode("utf-8")
 
 st.download_button(
-    "Download FW_candidates_journal.csv",
+    "Download FW_pipeline_scan.csv",
     data=csv_bytes,
-    file_name="FW_candidates_journal.csv",
+    file_name="FW_pipeline_scan.csv",
     mime="text/csv",
     use_container_width=True
+)
+
+st.caption(
+    "Save this CSV. On the next scan, upload it in the sidebar to detect which PRE_BREAKOUT stocks graduated into BREAKOUT."
 )
 
 
@@ -1296,34 +1495,33 @@ st.download_button(
 # FOOTER
 # ============================================================
 
-with st.expander("How this scanner matches Financial Wisdom"):
+with st.expander("How this pipeline works"):
     st.markdown(
         """
-        This clean scanner only displays stocks that pass the exact Financial Wisdom technical gate.
+        **PRE_BREAKOUT**
+        - Price is above the 20-week MA.
+        - Weekly MACD is bullish.
+        - NATR is below 8.
+        - A 6-week consolidation box exists.
+        - Price is still below resistance, but within 5% of the box high.
+        - Price is in the upper half of the box.
+        - Stop risk remains under 20%.
 
-        **Technical requirements**
-        - Weekly chart
-        - Price above 20-week MA
-        - Weekly MACD line above signal
-        - NATR below 8
-        - Minimum 6-week consolidation box
-        - Weekly close above resistance
-        - 10-week closing high
-        - Volume spike at least 30%
-        - Breakout size greater than 5% and less than 20%
-        - Upper wick 50% or less
-        - Stop risk under 20%
+        **BREAKOUT**
+        - All exact FW breakout rules pass:
+          - Weekly close above resistance
+          - 10-week closing high
+          - Volume spike at least 30%
+          - Breakout size between 5% and 20%
+          - Upper wick 50% or less
+          - Stop risk under 20%
 
-        **Fundamental requirements**
-        - ROC above 10%
-        - ROE above 10%
-        - Operating margin above 10%
-        - Revenue positive
-        - Net income positive
+        **GRADUATED**
+        - A stock was PRE_BREAKOUT in the previous scan CSV.
+        - It is now BREAKOUT.
 
-        **Important**
-        - If fundamentals return FUND_ERROR, manually verify them.
-        - Yahoo/yfinance may rate-limit fundamentals.
-        - Technical pass candidates are still valuable even if fundamentals fail to load.
+        **Fundamentals**
+        - Fundamentals only run on BREAKOUT names.
+        - If Yahoo/yfinance returns FUND_ERROR, manually verify fundamentals.
         """
     )
